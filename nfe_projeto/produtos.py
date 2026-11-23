@@ -5,6 +5,10 @@ Escopo: consultas e atualizações da tabela produtos + as duas visões (lista e
 """
 import flet as ft
 
+from nfe_projeto.importar import ORIGENS, TRIBUTOS
+
+SIGLAS = [sigla for sigla, _ in TRIBUTOS]
+
 
 # ----------------------------------------------------------------------------- consultas
 
@@ -12,7 +16,7 @@ def listar_produtos(app, busca="", status=""):
     """Produtos com fornecedor e quantidade de compras. Filtra por texto e por status."""
     like = f"%{busca.strip()}%"
     return app.consultar("""
-        SELECT p.id, p.codigo, p.ean, p.descricao, p.ncm, p.cclasstrib, p.unidade, p.status,
+        SELECT p.id, p.codigo, p.ean, p.descricao, p.ncm, p.cclasstrib, p.origem, p.unidade, p.status,
                f.nome AS fornecedor,
                (SELECT COUNT(*) FROM itens_nota i WHERE i.produto_id = p.id) AS compras
         FROM produtos p JOIN fornecedores f ON f.id = p.fornecedor_id
@@ -32,18 +36,28 @@ def obter_produto(app, produto_id):
 
 
 def tributacao_atual(app, produto_id):
-    """Impostos do item mais recente comprado desse produto (é o que se leva para o cadastro)."""
-    return app.consultar("""
-        SELECT t.sigla, ii.cst, ii.base, ii.aliquota, ii.valor, ii.detalhe
+    """Impostos do item mais recente comprado desse produto (é o que se leva para o cadastro),
+    na ordem do catálogo de tributos (ICMS, FCP, ICMS-ST... CBS)."""
+    linhas = app.consultar("""
+        SELECT t.sigla, ii.cst, ii.modalidade, ii.base, ii.reducao_base, ii.mva, ii.aliquota, ii.valor, ii.detalhe
         FROM impostos_item ii
         JOIN tributos t ON t.id = ii.tributo_id
-        WHERE ii.item_id = (SELECT MAX(id) FROM itens_nota WHERE produto_id = ?)
-        ORDER BY t.id""", (produto_id,))
+        WHERE ii.item_id = (SELECT MAX(id) FROM itens_nota WHERE produto_id = ?)""", (produto_id,))
+    return sorted(linhas, key=lambda x: SIGLAS.index(x["sigla"]) if x["sigla"] in SIGLAS else len(SIGLAS))
+
+
+def ultima_compra(app, produto_id):
+    """Dados do item mais recente (CFOP, origem, benefício fiscal) para a ficha."""
+    linhas = app.consultar("""
+        SELECT cfop, origem, cbenef FROM itens_nota
+        WHERE id = (SELECT MAX(id) FROM itens_nota WHERE produto_id = ?)""", (produto_id,))
+    return linhas[0] if linhas else None
 
 
 def historico_produto(app, produto_id):
     return app.consultar("""
-        SELECT n.numero, n.data_emissao, i.cfop, i.quantidade, i.valor_unitario, i.valor_total
+        SELECT n.numero, n.data_emissao, i.cfop, i.quantidade, i.valor_unitario, i.valor_total,
+               i.frete, i.seguro, i.desconto, i.outras
         FROM itens_nota i JOIN notas n ON n.id = i.nota_id
         WHERE i.produto_id = ?
         ORDER BY n.id DESC""", (produto_id,))
@@ -64,11 +78,13 @@ def _lista(app):
 
     def montar():
         linhas = [[app.selo_produto(p["status"]), p["codigo"], p["descricao"][:48], p["ncm"],
+                   ft.Text(p["origem"] or "—", size=13, tooltip=ORIGENS.get(p["origem"])),
                    p["cclasstrib"] or "—", p["ean"] or "—", p["unidade"], p["fornecedor"], str(p["compras"]),
                    app.botao("Ficha", lambda e, i=p["id"]: app.ir("produtos", produto_id=i), False)]
                   for p in listar_produtos(app, busca.value or "", filtro["status"])]
         lista.content = app.tabela(
-            ["Status", "Código", "Descrição", "NCM", "cClassTrib", "EAN", "Un.", "Fornecedor", "Compras", ""],
+            ["Status", "Código", "Descrição", "NCM", "Orig.", "cClassTrib", "EAN", "Un.", "Fornecedor", "Compras",
+             ""],
             linhas,
             texto_vazio="Nenhum produto encontrado. Importe uma NF-e para criá-los.")
 
@@ -100,13 +116,18 @@ def _ficha(app, produto_id):
     cest = app.campo("CEST", produto["cest"], 150)
     unidade = app.campo("Unidade", produto["unidade"], 110)
     cclasstrib = app.campo("cClassTrib (IBS/CBS)", produto["cclasstrib"], 200)
+    opcao = getattr(ft, "DropdownOption", None) or ft.dropdown.Option  # nome muda entre versões do Flet
+    origem = ft.Dropdown(label="Origem da mercadoria", value=produto["origem"] or None, width=520,
+                         options=[opcao(key=k, text=f"{k} – {v}") for k, v in ORIGENS.items()])
     aviso = ft.Text("", color=app.cor.VERDE)
 
     def salvar(e):
-        app.executar("""UPDATE produtos SET descricao = ?, ncm = ?, ean = ?, cest = ?, unidade = ?, cclasstrib = ?
+        app.executar("""UPDATE produtos SET descricao = ?, ncm = ?, ean = ?, cest = ?, unidade = ?, cclasstrib = ?,
+                                            origem = ?
                         WHERE id = ?""",
                      (descricao.value.strip() or produto["descricao"], ncm.value.strip(), ean.value.strip(),
-                      cest.value.strip(), unidade.value.strip(), cclasstrib.value.strip(), produto_id))
+                      cest.value.strip(), unidade.value.strip(), cclasstrib.value.strip(), origem.value or "",
+                      produto_id))
         aviso.value = "Dados salvos."
         app.page.update()
 
@@ -123,21 +144,35 @@ def _ficha(app, produto_id):
                 ft.Text(f"Código {produto['codigo']}  ·  {produto['fornecedor']}", color=app.cor.MUTED)]),
         descricao,
         ft.Row([ncm, ean, cest, unidade, cclasstrib], wrap=True),
+        origem,
         ft.Row([app.botao("Salvar alterações", salvar), app.botao(rotulo_status, alternar_status, False), aviso]),
     ], spacing=12))
+
+    compra = ultima_compra(app, produto_id)
+    resumo_compra = ft.Text(
+        f"Última compra: CFOP {compra['cfop'] or '—'}  ·  benefício fiscal (cBenef) {compra['cbenef'] or '—'}"
+        if compra else "Sem compras.", color=app.cor.MUTED)
+
+    def valor_ou_traco(valor):
+        return app.dinheiro(valor) if valor else "—"
 
     return ft.Column([
         app.titulo("Ficha do produto", "Dados para levar ao cadastro no outro sistema",
                    app.botao("Voltar", lambda e: app.ir("produtos"), False)),
         formulario,
         app.subtitulo("Tributação (item mais recente comprado)"),
-        app.tabela(["Tributo", "CST / CSOSN", "Base de cálculo", "Alíquota", "Valor", "Detalhes"],
-                   [[x["sigla"], x["cst"] or "—", app.dinheiro(x["base"]), app.percentual(x["aliquota"]),
+        resumo_compra,
+        app.tabela(["Tributo", "CST / CSOSN", "Modalidade da base", "Base de cálculo", "Redução da base", "MVA",
+                    "Alíquota", "Valor", "Detalhes"],
+                   [[x["sigla"], x["cst"] or "—", x["modalidade"] or "—", app.dinheiro(x["base"]),
+                     app.percentual(x["reducao_base"]), app.percentual(x["mva"]), app.percentual(x["aliquota"]),
                      app.dinheiro(x["valor"]), x["detalhe"] or "—"] for x in tributacao_atual(app, produto_id)],
                    texto_vazio="Sem impostos destacados."),
         app.subtitulo("Histórico de compras"),
-        app.tabela(["NF", "Emissão", "CFOP", "Quantidade", "Valor unitário", "Valor total"],
+        app.tabela(["NF", "Emissão", "CFOP", "Quantidade", "Valor unitário", "Valor total", "Frete", "Seguro",
+                    "Desconto", "Outras despesas"],
                    [[h["numero"], app.data_br(h["data_emissao"]), h["cfop"], app.quantidade(h["quantidade"]),
-                     app.dinheiro(h["valor_unitario"]), app.dinheiro(h["valor_total"])]
+                     app.dinheiro(h["valor_unitario"]), app.dinheiro(h["valor_total"]), valor_ou_traco(h["frete"]),
+                     valor_ou_traco(h["seguro"]), valor_ou_traco(h["desconto"]), valor_ou_traco(h["outras"])]
                     for h in historico_produto(app, produto_id)]),
     ], spacing=16)

@@ -162,12 +162,16 @@ def vazio(texto):
 
 
 def resumo_imposto(imposto):
-    """'CST 00 · 18,00% · R$ 117,00' a partir de uma linha de impostos_item (ou '—' se não existir)."""
+    """'CST 10 · MVA 40,00% · 18,00% · R$ 25,88' a partir de uma linha de impostos_item ('—' se não existir)."""
     if not imposto:
         return "—"
     partes = []
     if imposto["cst"]:
         partes.append("CST " + imposto["cst"])
+    if imposto.get("mva") is not None:
+        partes.append("MVA " + percentual(imposto["mva"]))
+    if imposto.get("reducao_base") is not None:
+        partes.append("red. " + percentual(imposto["reducao_base"]))
     if imposto["aliquota"] is not None:
         partes.append(percentual(imposto["aliquota"]))
     if imposto["valor"] is not None:

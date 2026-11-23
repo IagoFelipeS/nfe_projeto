@@ -2,10 +2,11 @@
 
 Escopo deste arquivo:
   1. BANCO: esquema SQLite (8 tabelas, PKs e FKs 1:N) e conexão.
-  2. XML: lê a NF-e e extrai produto + impostos de cada item.
-  3. CONFERÊNCIA: regras que geram os alertas de cada item (as da reforma tributária ficam em reforma.py).
-  4. IMPORTAÇÃO: grava tudo em uma transação e registra o histórico.
-  5. TELA: escolher os XMLs e mostrar o resultado e o histórico.
+  2. XML: lê a NF-e e extrai produto + impostos de cada item (ICMS, FCP, ICMS-ST, FCP-ST, DIFAL,
+     ICMS desonerado, IPI, II, PIS, COFINS, IS, IBS e CBS), com MVA, redução de base e modalidade.
+  3. IMPORTAÇÃO: grava tudo em uma transação e registra o histórico. As regras que geram os alertas
+     ficam em conferencia.py (gerais) e reforma.py (IBS/CBS).
+  4. TELA: escolher os XMLs e mostrar o resultado e o histórico.
 
 Relacionamentos 1:N (pai -> filhos):
     fornecedores -> notas            fornecedores -> produtos
@@ -20,21 +21,48 @@ from pathlib import Path
 
 import flet as ft
 
-from nfe_projeto import reforma
+from nfe_projeto import conferencia, reforma
 
 # Arquivo do banco SQLite: pasta banco/ na raiz do projeto
 BANCO = Path(__file__).resolve().parent.parent / "banco" / "nfe_importador.db"
 
-# Catálogo de tributos (vira a tabela `tributos`)
+# Catálogo de tributos (vira a tabela `tributos`). A ordem aqui é a ordem de exibição nas telas.
 TRIBUTOS = [
     ("ICMS", "Imposto sobre Circulação de Mercadorias e Serviços"),
+    ("FCP", "Fundo de Combate à Pobreza sobre o ICMS próprio"),
     ("ICMS-ST", "ICMS por Substituição Tributária"),
+    ("FCP-ST", "Fundo de Combate à Pobreza retido por Substituição Tributária"),
+    ("DIFAL", "ICMS diferencial de alíquota devido à UF de destino"),
+    ("FCP-DIFAL", "Fundo de Combate à Pobreza devido à UF de destino"),
+    ("ICMS-Deson", "ICMS desonerado"),
     ("IPI", "Imposto sobre Produtos Industrializados"),
+    ("II", "Imposto de Importação"),
     ("PIS", "Programa de Integração Social"),
     ("COFINS", "Contribuição para o Financiamento da Seguridade Social"),
+    ("IS", "Imposto Seletivo (reforma tributária)"),
     ("IBS", "Imposto sobre Bens e Serviços (reforma tributária)"),
     ("CBS", "Contribuição sobre Bens e Serviços (reforma tributária)"),
 ]
+
+# Origem da mercadoria (tag orig, 1º dígito do CST do ICMS)
+ORIGENS = {
+    "0": "Nacional",
+    "1": "Estrangeira, importação direta",
+    "2": "Estrangeira, adquirida no mercado interno",
+    "3": "Nacional, conteúdo de importação acima de 40% e até 70%",
+    "4": "Nacional, produzida conforme processo produtivo básico",
+    "5": "Nacional, conteúdo de importação até 40%",
+    "6": "Estrangeira, importação direta sem similar nacional (lista CAMEX)",
+    "7": "Estrangeira, mercado interno, sem similar nacional (lista CAMEX)",
+    "8": "Nacional, conteúdo de importação acima de 70%",
+}
+
+# Modalidade de determinação da base do ICMS (modBC) e do ICMS-ST (modBCST)
+MODALIDADES_BC = {"0": "Margem de valor agregado", "1": "Pauta (valor)", "2": "Preço tabelado máximo",
+                  "3": "Valor da operação"}
+MODALIDADES_BCST = {"0": "Preço tabelado ou máximo sugerido", "1": "Lista negativa", "2": "Lista positiva",
+                    "3": "Lista neutra", "4": "Margem de valor agregado (MVA)", "5": "Pauta (valor)",
+                    "6": "Valor da operação"}
 
 
 # =============================================================================
@@ -71,7 +99,8 @@ CREATE TABLE IF NOT EXISTS produtos (
     cest           TEXT NOT NULL DEFAULT '',
     unidade        TEXT NOT NULL DEFAULT '',
     cclasstrib     TEXT NOT NULL DEFAULT '',    -- classificação tributária do IBS/CBS (reforma)
-    status        TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente', 'cadastrado')),
+    origem         TEXT NOT NULL DEFAULT '',    -- origem da mercadoria (0 a 8)
+    status       TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente', 'cadastrado')),
     UNIQUE (fornecedor_id, codigo)
 );
 
@@ -85,7 +114,13 @@ CREATE TABLE IF NOT EXISTS itens_nota (
     valor_unitario  REAL,
     valor_total     REAL,
     grupo_icms      TEXT NOT NULL DEFAULT '',   -- ex.: ICMS00, ICMSSN102
-    cclasstrib      TEXT NOT NULL DEFAULT ''    -- cClassTrib do IBS/CBS informado neste item
+    cclasstrib      TEXT NOT NULL DEFAULT '',   -- cClassTrib do IBS/CBS informado neste item
+    origem          TEXT NOT NULL DEFAULT '',   -- origem da mercadoria (0 a 8)
+    cbenef          TEXT NOT NULL DEFAULT '',   -- código de benefício fiscal da UF
+    frete           REAL,
+    seguro          REAL,
+    desconto        REAL,
+    outras          REAL                        -- outras despesas acessórias
 );
 
 CREATE TABLE IF NOT EXISTS tributos (
@@ -98,11 +133,14 @@ CREATE TABLE IF NOT EXISTS impostos_item (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     item_id     INTEGER NOT NULL REFERENCES itens_nota(id) ON DELETE CASCADE,
     tributo_id  INTEGER NOT NULL REFERENCES tributos(id),
-    cst         TEXT NOT NULL DEFAULT '',       -- CST ou CSOSN
-    base        REAL,
-    aliquota    REAL,
-    valor       REAL,
-    detalhe     TEXT NOT NULL DEFAULT ''
+    cst           TEXT NOT NULL DEFAULT '',     -- CST ou CSOSN
+    modalidade    TEXT NOT NULL DEFAULT '',     -- como a base foi determinada (valor da operação, MVA...)
+    base          REAL,
+    reducao_base  REAL,                         -- % de redução da base de cálculo
+    mva           REAL,                         -- margem de valor agregado (ICMS-ST)
+    aliquota      REAL,
+    valor         REAL,
+    detalhe       TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS alertas (
@@ -129,6 +167,15 @@ CREATE INDEX IF NOT EXISTS idx_alertas_item ON alertas(item_id);
 """
 
 
+TEXTO = "TEXT NOT NULL DEFAULT ''"
+COLUNAS_NOVAS = {
+    "produtos": [("cclasstrib", TEXTO), ("origem", TEXTO)],
+    "itens_nota": [("cclasstrib", TEXTO), ("origem", TEXTO), ("cbenef", TEXTO), ("frete", "REAL"),
+                   ("seguro", "REAL"), ("desconto", "REAL"), ("outras", "REAL")],
+    "impostos_item": [("modalidade", TEXTO), ("reducao_base", "REAL"), ("mva", "REAL")],
+}
+
+
 def conectar(caminho=BANCO):
     """Abre o banco (criando a pasta, as tabelas e o catálogo de tributos na primeira vez)."""
     Path(caminho).parent.mkdir(parents=True, exist_ok=True)
@@ -136,11 +183,12 @@ def conectar(caminho=BANCO):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")  # SQLite só respeita FKs se isto estiver ligado
     conn.executescript(ESQUEMA)
-    # Bancos criados antes da coluna cclasstrib existir recebem a coluna aqui
-    for tabela in ("produtos", "itens_nota"):
-        colunas = {linha["name"] for linha in conn.execute(f"PRAGMA table_info({tabela})")}
-        if "cclasstrib" not in colunas:
-            conn.execute(f"ALTER TABLE {tabela} ADD COLUMN cclasstrib TEXT NOT NULL DEFAULT ''")
+    # Bancos criados por versões anteriores recebem aqui as colunas que faltam
+    for tabela, colunas in COLUNAS_NOVAS.items():
+        existentes = {linha["name"] for linha in conn.execute(f"PRAGMA table_info({tabela})")}
+        for nome, tipo in colunas:
+            if nome not in existentes:
+                conn.execute(f"ALTER TABLE {tabela} ADD COLUMN {nome} {tipo}")
     conn.executemany("INSERT OR IGNORE INTO tributos (sigla, nome) VALUES (?, ?)", TRIBUTOS)
     conn.commit()
     return conn
@@ -263,6 +311,8 @@ def _ler_item(det):
     except ValueError:
         raise ValueError("número de item inválido no XML")
     ibscbs = _ler_ibscbs(imp.find("IBSCBS") if imp is not None else None)
+    grupo_icms = icms[0] if icms is not None and len(icms) else None
+    difal = imp.find("ICMSUFDest") if imp is not None else None
     return {
         "n": numero,
         "cod": t(prod, "cProd"),
@@ -270,19 +320,35 @@ def _ler_item(det):
         "desc": t(prod, "xProd"),
         "ncm": t(prod, "NCM"),
         "cest": t(prod, "CEST"),
+        "cbenef": t(prod, "cBenef"),
         "cfop": t(prod, "CFOP"),
         "un": t(prod, "uCom"),
         "qtd": t(prod, "qCom"),
         "vun": t(prod, "vUnCom"),
         "vtot": t(prod, "vProd"),
-        "icms_grupo": icms[0].tag if icms is not None and len(icms) else "",
+        "frete": t(prod, "vFrete"),
+        "seguro": t(prod, "vSeg"),
+        "desconto": t(prod, "vDesc"),
+        "outras": t(prod, "vOutro"),
+        "icms_grupo": grupo_icms.tag if grupo_icms is not None else "",
+        "icms": _tags(grupo_icms),   # todas as tags do grupo ICMSxx (usadas na conferência)
+        "difal": _tags(difal),
         "ibscbs": ibscbs,
         "impostos": _impostos(imp, ibscbs),
     }
 
 
-def _imposto(sigla, cst="", base="", aliq="", valor="", detalhe=""):
-    return {"sigla": sigla, "cst": cst, "base": base, "aliq": aliq, "valor": valor, "detalhe": detalhe}
+def _tags(grupo):
+    """{tag: texto} dos filhos diretos de um grupo do XML ({} se o grupo não existe)."""
+    if grupo is None:
+        return {}
+    return {filho.tag: (filho.text or "").strip() for filho in grupo}
+
+
+def _imposto(sigla, cst="", base="", aliq="", valor="", detalhe="", modalidade="", reducao="", mva="",
+             retido=False):
+    return {"sigla": sigla, "cst": cst, "base": base, "aliq": aliq, "valor": valor, "detalhe": detalhe,
+            "modalidade": modalidade, "reducao": reducao, "mva": mva, "retido": retido}
 
 
 def _impostos(imp, ibs):
@@ -290,36 +356,101 @@ def _impostos(imp, ibs):
     lista = []
     if imp is not None:
         lista += _icms(imp.find("ICMS"))
+        lista += _difal(imp.find("ICMSUFDest"))
         ipi = imp.find("IPI")
         if t(ipi, "CST"):
-            enq = t(ipi, "cEnq")
+            partes = [f"enquadramento {t(ipi, 'cEnq')}"] if t(ipi, "cEnq") else []
+            if t(ipi, "qUnid"):  # IPI por unidade (ex.: bebidas, cigarros)
+                partes.append(f"{br(t(ipi, 'qUnid'), 4)} un. × R$ {br(t(ipi, 'vUnid'), 4)}")
             lista.append(_imposto("IPI", t(ipi, "CST"), t(ipi, "vBC"), t(ipi, "pIPI"), t(ipi, "vIPI"),
-                                  f"enquadramento {enq}" if enq else ""))
+                                  " · ".join(partes)))
+        ii = imp.find("II")
+        if ii is not None:
+            partes = [f"despesas aduaneiras R$ {br(t(ii, 'vDespAdu'))}"] if t(ii, "vDespAdu") else []
+            if t(ii, "vIOF"):
+                partes.append(f"IOF R$ {br(t(ii, 'vIOF'))}")
+            lista.append(_imposto("II", "", t(ii, "vBC"), "", t(ii, "vII"), " · ".join(partes)))
         for sigla in ("PIS", "COFINS"):
             grupo = imp.find(sigla)
             if t(grupo, "CST"):
+                detalhe = ""
+                if t(grupo, "qBCProd"):  # PIS/COFINS por quantidade (ex.: combustíveis, bebidas)
+                    detalhe = f"{br(t(grupo, 'qBCProd'), 4)} un. × R$ {br(t(grupo, 'vAliqProd'), 4)}"
                 lista.append(_imposto(sigla, t(grupo, "CST"), t(grupo, "vBC"), t(grupo, f"p{sigla}"),
-                                      t(grupo, f"v{sigla}")))
+                                      t(grupo, f"v{sigla}"), detalhe))
+        lista += _imposto_seletivo(imp.find("IS"))
     lista += _ibs_cbs(ibs)
     return lista
 
 
 def _icms(icms):
+    """ICMS próprio, FCP, ICMS-ST, FCP-ST e ICMS desonerado do grupo ICMSxx."""
     if icms is None or not len(icms):
         return []
-    detalhe = icms[0].tag
-    if t(icms, "vCredICMSSN"):
-        detalhe += f" · crédito Simples R$ {br(t(icms, 'vCredICMSSN'))}"
-    if t(icms, "pRedBC"):
-        detalhe += f" · redução da base {br(t(icms, 'pRedBC'))}%"
-    cst = t(icms, "CST", "CSOSN")  # CST (regime normal) ou CSOSN (Simples)
-    lista = [_imposto("ICMS", cst, t(icms, "vBC"), t(icms, "pICMS"), t(icms, "vICMS"), detalhe)]
-    st_base, st_aliq = t(icms, "vBCST", "vBCSTRet"), t(icms, "pICMSST", "pST")
-    st_valor = t(icms, "vICMSST", "vICMSSTRet")
-    if st_base or st_aliq or st_valor:
-        mva = t(icms, "pMVAST")
-        lista.append(_imposto("ICMS-ST", cst, st_base, st_aliq, st_valor, f"MVA {br(mva)}%" if mva else ""))
+    g = icms[0]
+    cst = t(g, "CST", "CSOSN")  # CST (regime normal) ou CSOSN (Simples)
+    orig = t(g, "orig")
+    partes = [g.tag]
+    if orig:
+        partes.append(f"origem {orig} ({ORIGENS.get(orig, '?')})")
+    if t(g, "vCredICMSSN"):
+        partes.append(f"crédito Simples {br(t(g, 'pCredSN'))}% = R$ {br(t(g, 'vCredICMSSN'))}")
+    if t(g, "pDif"):
+        partes.append(f"diferimento {br(t(g, 'pDif'))}% (R$ {br(t(g, 'vICMSDif'))} diferido, "
+                      f"ICMS da operação R$ {br(t(g, 'vICMSOp'))})")
+    lista = [_imposto("ICMS", cst, t(g, "vBC"), t(g, "pICMS"), t(g, "vICMS"), " · ".join(partes),
+                      MODALIDADES_BC.get(t(g, "modBC"), ""), t(g, "pRedBC"))]
+
+    if t(g, "vBCFCP") or t(g, "pFCP") or t(g, "vFCP"):
+        lista.append(_imposto("FCP", cst, t(g, "vBCFCP") or t(g, "vBC"), t(g, "pFCP"), t(g, "vFCP")))
+
+    if t(g, "vBCST") or t(g, "pICMSST") or t(g, "vICMSST"):
+        lista.append(_imposto("ICMS-ST", cst, t(g, "vBCST"), t(g, "pICMSST"), t(g, "vICMSST"),
+                              modalidade=MODALIDADES_BCST.get(t(g, "modBCST"), ""), reducao=t(g, "pRedBCST"),
+                              mva=t(g, "pMVAST")))
+    elif t(g, "vBCSTRet") or t(g, "vICMSSTRet"):  # ST cobrada anteriormente (ICMS60, CSOSN 500)
+        detalhe = "retido anteriormente"
+        if t(g, "vICMSSubstituto"):
+            detalhe += f" · ICMS do substituto R$ {br(t(g, 'vICMSSubstituto'))}"
+        lista.append(_imposto("ICMS-ST", cst, t(g, "vBCSTRet"), t(g, "pST"), t(g, "vICMSSTRet"), detalhe,
+                              retido=True))
+
+    if t(g, "vBCFCPST") or t(g, "pFCPST") or t(g, "vFCPST"):
+        lista.append(_imposto("FCP-ST", cst, t(g, "vBCFCPST"), t(g, "pFCPST"), t(g, "vFCPST")))
+    elif t(g, "vFCPSTRet"):
+        lista.append(_imposto("FCP-ST", cst, t(g, "vBCFCPSTRet"), t(g, "pFCPSTRet"), t(g, "vFCPSTRet"),
+                              "retido anteriormente", retido=True))
+
+    if t(g, "vICMSDeson"):
+        lista.append(_imposto("ICMS-Deson", cst, valor=t(g, "vICMSDeson"),
+                              detalhe=f"motivo {t(g, 'motDesICMS') or '—'}"))
     return lista
+
+
+def _difal(d):
+    """DIFAL: venda interestadual a consumidor final não contribuinte (grupo ICMSUFDest)."""
+    if d is None:
+        return []
+    detalhe = (f"interestadual {br(t(d, 'pICMSInter'))}% · interna destino {br(t(d, 'pICMSUFDest'))}% · "
+               f"partilha destino {br(t(d, 'pICMSInterPart'))}%")
+    if t(d, "vICMSUFRemet") and para_decimal(t(d, "vICMSUFRemet")):
+        detalhe += f" · UF de origem R$ {br(t(d, 'vICMSUFRemet'))}"
+    lista = [_imposto("DIFAL", "", t(d, "vBCUFDest"), t(d, "pICMSUFDest"), t(d, "vICMSUFDest"), detalhe)]
+    if t(d, "pFCPUFDest") or t(d, "vFCPUFDest"):
+        lista.append(_imposto("FCP-DIFAL", "", t(d, "vBCFCPUFDest") or t(d, "vBCUFDest"), t(d, "pFCPUFDest"),
+                              t(d, "vFCPUFDest")))
+    return lista
+
+
+def _imposto_seletivo(grupo):
+    """Imposto Seletivo (reforma tributária): bebidas, fumo, veículos etc."""
+    if grupo is None:
+        return []
+    partes = [f"cClassTrib {t(grupo, 'cClassTribIS')}"] if t(grupo, "cClassTribIS") else []
+    if t(grupo, "pISEspec"):
+        partes.append(f"alíquota específica R$ {br(t(grupo, 'pISEspec'), 4)}")
+    return [_imposto("IS", t(grupo, "CSTIS"), t(grupo, "vBCIS"), t(grupo, "pIS"), t(grupo, "vIS"),
+                     " · ".join(partes))]
 
 
 def _ibs_cbs(g):
@@ -351,53 +482,14 @@ def _ibs_cbs(g):
 
 
 # =============================================================================
-# 3. CONFERÊNCIA (gera os alertas)
+# 3. IMPORTAÇÃO PARA O BANCO
 # =============================================================================
-
-TOLERANCIA = Decimal("0.02")  # diferença aceita por arredondamento
-
-
-def _bate(base, aliq, valor):
-    """True se base x alíquota/100 for igual ao valor (ou se faltar dado para conferir)."""
-    b, a, v = para_decimal(base), para_decimal(aliq), para_decimal(valor)
-    if b is None or a is None or v is None:
-        return True
-    return abs(b * a / 100 - v) <= TOLERANCIA
-
 
 def validar_item(item, crt, ano=0):
-    """Devolve a lista de problemas do item. `crt` é o regime tributário do emitente e `ano` o ano de emissão
-    (usado pelas regras da reforma tributária, em reforma.py)."""
-    msgs = []
-
-    ncm = item["ncm"]
-    if not (len(ncm) == 8 and ncm.isdigit()):
-        msgs.append(f"NCM ausente ou inválido ({ncm or 'vazio'})")
-
-    qtd, unit, total = para_decimal(item["qtd"]), para_decimal(item["vun"]), para_decimal(item["vtot"])
-    if None not in (qtd, unit, total) and abs(qtd * unit - total) > TOLERANCIA:
-        msgs.append("Valor total diferente de quantidade × valor unitário")
-
-    grupo = item["icms_grupo"]
-    if not grupo:
-        msgs.append("Item sem grupo de ICMS")
-    else:
-        usa_csosn = grupo.startswith("ICMSSN")  # CSOSN = códigos do Simples Nacional
-        if crt in ("1", "4") and not usa_csosn:
-            msgs.append("Emitente do Simples Nacional, mas o ICMS veio com CST (esperado CSOSN)")
-        if crt in ("2", "3") and usa_csosn:
-            msgs.append("Emitente do regime normal, mas o ICMS veio com CSOSN (esperado CST)")
-
-    # IBS/CBS são conferidos em reforma.py, que considera redução de alíquota e alíquota efetiva
-    for imp in item["impostos"]:
-        if imp["sigla"] in ("ICMS", "IPI", "PIS", "COFINS") and not _bate(imp["base"], imp["aliq"], imp["valor"]):
-            msgs.append(f"{imp['sigla']}: base × alíquota não bate com o valor informado")
-    return msgs + reforma.validar_item(item, crt, ano)
+    """Todos os alertas do item: regras gerais (conferencia.py) + reforma tributária (reforma.py)."""
+    return conferencia.validar_item(item, crt) + reforma.validar_item(item, crt, ano)
 
 
-# =============================================================================
-# 4. IMPORTAÇÃO PARA O BANCO
-# =============================================================================
 
 def importar_arquivo(conn, caminho):
     """Importa um XML. Devolve (resultado, mensagem), com resultado 'ok', 'duplicada' ou 'erro'.
@@ -443,19 +535,30 @@ def _gravar(conn, cab, itens, arquivo):
                              f"({anterior['cclasstrib']})")
         elif anterior and cclass and not anterior["cclasstrib"]:
             conn.execute("UPDATE produtos SET cclasstrib = ? WHERE id = ?", (cclass, produto_id))
+        origem = item["icms"].get("orig", "")
+        if anterior and origem and anterior["origem"] and anterior["origem"] != origem:
+            mensagens.append(f"Origem da mercadoria {origem} diferente do cadastro anterior do produto "
+                             f"({anterior['origem']})")
+        elif anterior and origem and not anterior["origem"]:
+            conn.execute("UPDATE produtos SET origem = ? WHERE id = ?", (origem, produto_id))
 
         item_id = conn.execute(
-            """INSERT INTO itens_nota (nota_id, produto_id, numero_item, cfop, quantidade,
-                                       valor_unitario, valor_total, grupo_icms, cclasstrib)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO itens_nota (nota_id, produto_id, numero_item, cfop, quantidade, valor_unitario,
+                                       valor_total, grupo_icms, cclasstrib, origem, cbenef,
+                                       frete, seguro, desconto, outras)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (nota_id, produto_id, item["n"], item["cfop"], como_float(item["qtd"]), como_float(item["vun"]),
-             como_float(item["vtot"]), item["icms_grupo"], cclass)).lastrowid
+             como_float(item["vtot"]), item["icms_grupo"], cclass, origem, item["cbenef"],
+             como_float(item["frete"]), como_float(item["seguro"]), como_float(item["desconto"]),
+             como_float(item["outras"]))).lastrowid
         for imp in item["impostos"]:
             conn.execute(
-                """INSERT INTO impostos_item (item_id, tributo_id, cst, base, aliquota, valor, detalhe)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (item_id, tributos[imp["sigla"]], imp["cst"], como_float(imp["base"]),
-                 como_float(imp["aliq"]), como_float(imp["valor"]), imp["detalhe"]))
+                """INSERT INTO impostos_item (item_id, tributo_id, cst, modalidade, base, reducao_base, mva,
+                                              aliquota, valor, detalhe)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (item_id, tributos[imp["sigla"]], imp["cst"], imp["modalidade"], como_float(imp["base"]),
+                 como_float(imp["reducao"]), como_float(imp["mva"]), como_float(imp["aliq"]),
+                 como_float(imp["valor"]), imp["detalhe"]))
         for mensagem in mensagens:
             conn.execute("INSERT INTO alertas (item_id, mensagem) VALUES (?, ?)", (item_id, mensagem))
     return nota_id
@@ -472,17 +575,18 @@ def _fornecedor(conn, cab):
 
 
 def _produto(conn, fornecedor_id, item):
-    """Acha o produto (fornecedor + código) ou cria. Devolve (id, cadastro anterior com ncm e cclasstrib)
-    — o cadastro anterior é None quando o produto acabou de ser criado."""
-    linha = conn.execute("SELECT id, ncm, cclasstrib FROM produtos WHERE fornecedor_id = ? AND codigo = ?",
-                         (fornecedor_id, item["cod"])).fetchone()
+    """Acha o produto (fornecedor + código) ou cria. Devolve (id, cadastro anterior com ncm, cclasstrib e
+    origem) — o cadastro anterior é None quando o produto acabou de ser criado."""
+    linha = conn.execute("""SELECT id, ncm, cclasstrib, origem FROM produtos
+                            WHERE fornecedor_id = ? AND codigo = ?""", (fornecedor_id, item["cod"])).fetchone()
     if linha:
         return linha["id"], linha
     novo = conn.execute(
-        """INSERT INTO produtos (fornecedor_id, codigo, ean, descricao, ncm, cest, unidade, cclasstrib)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO produtos (fornecedor_id, codigo, ean, descricao, ncm, cest, unidade, cclasstrib, origem)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (fornecedor_id, item["cod"], item["ean"], item["desc"] or "(sem descrição)", item["ncm"],
-         item["cest"], item["un"], item["ibscbs"]["cclasstrib"] if item["ibscbs"] else "")).lastrowid
+         item["cest"], item["un"], item["ibscbs"]["cclasstrib"] if item["ibscbs"] else "",
+         item["icms"].get("orig", ""))).lastrowid
     return novo, None
 
 
@@ -494,7 +598,7 @@ def _registrar(conn, arquivo, resultado, mensagem, nota_id=None):
 
 
 # =============================================================================
-# 5. TELA
+# 4. TELA
 # =============================================================================
 
 def historico_importacoes(app, limite=30):

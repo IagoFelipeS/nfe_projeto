@@ -1,13 +1,16 @@
 """Tela 3 — Notas fiscais: lista das notas importadas e, ao abrir uma nota, o detalhe com
-todos os impostos de cada item (ICMS, ICMS-ST, IPI, PIS, COFINS, IBS e CBS).
+todos os impostos de cada item (ICMS, FCP, ICMS-ST, FCP-ST, DIFAL, IPI, II, PIS, COFINS, IS, IBS e CBS).
 
 Escopo: consultas de notas/itens/impostos + as duas visões (lista e detalhe) da mesma tela.
+No detalhe, só aparecem as colunas dos tributos que existem na nota aberta.
 """
 import flet as ft
 
-COLUNAS_DETALHE = ["Status", "#", "Código", "Descrição", "NCM", "CFOP", "cClassTrib", "Qtd", "Valor total",
-                   "ICMS", "ICMS-ST", "IPI", "PIS", "COFINS", "IBS", "CBS"]
-SIGLAS = ("ICMS", "ICMS-ST", "IPI", "PIS", "COFINS", "IBS", "CBS")
+from nfe_projeto.importar import ORIGENS, TRIBUTOS
+
+COLUNAS_ITEM = ["Status", "#", "Código", "Descrição", "NCM", "CFOP", "Orig.", "cClassTrib", "Qtd",
+                "Valor total"]
+SIGLAS = [sigla for sigla, _ in TRIBUTOS]  # ordem de exibição dos tributos
 
 
 # ----------------------------------------------------------------------------- consultas
@@ -38,13 +41,14 @@ def obter_nota(app, nota_id):
 def itens_da_nota(app, nota_id):
     """Itens da nota com o produto, os impostos (dicionário por sigla) e os alertas em aberto."""
     itens = app.consultar("""
-        SELECT i.id, i.numero_item, i.cfop, i.cclasstrib, i.quantidade, i.valor_unitario, i.valor_total,
+        SELECT i.id, i.numero_item, i.cfop, i.cclasstrib, i.origem, i.quantidade, i.valor_unitario,
+               i.valor_total,
                p.id AS produto_id, p.codigo, p.descricao, p.ncm
         FROM itens_nota i JOIN produtos p ON p.id = i.produto_id
         WHERE i.nota_id = ?
         ORDER BY i.numero_item""", (nota_id,))
     impostos = app.consultar("""
-        SELECT ii.item_id, t.sigla, ii.cst, ii.base, ii.aliquota, ii.valor, ii.detalhe
+        SELECT ii.item_id, t.sigla, ii.cst, ii.base, ii.reducao_base, ii.mva, ii.aliquota, ii.valor, ii.detalhe
         FROM impostos_item ii JOIN tributos t ON t.id = ii.tributo_id
         WHERE ii.item_id IN (SELECT id FROM itens_nota WHERE nota_id = ?)""", (nota_id,))
     alertas = app.consultar("""
@@ -87,14 +91,17 @@ def _detalhe(app, nota_id):
     if nota is None:
         return app.vazio("Nota não encontrada.")
 
+    itens = itens_da_nota(app, nota_id)
+    presentes = [s for s in SIGLAS if any(s in it["impostos"] for it in itens)]  # só tributos desta nota
     linhas, destaques = [], []
-    for it in itens_da_nota(app, nota_id):
+    for it in itens:
         descricao = ft.TextButton(it["descricao"][:38], tooltip="Abrir ficha do produto",
                                   on_click=lambda e, p=it["produto_id"]: app.ir("produtos", produto_id=p))
+        origem = ft.Text(it["origem"] or "—", size=13, tooltip=ORIGENS.get(it["origem"]))
         linhas.append([app.selo_conferencia(it["alertas"]), str(it["numero_item"]), it["codigo"], descricao,
-                       it["ncm"], it["cfop"], it["cclasstrib"] or "—", app.quantidade(it["quantidade"]),
+                       it["ncm"], it["cfop"], origem, it["cclasstrib"] or "—", app.quantidade(it["quantidade"]),
                        app.dinheiro(it["valor_total"])]
-                      + [app.resumo_imposto(it["impostos"].get(s)) for s in SIGLAS])
+                      + [app.resumo_imposto(it["impostos"].get(s)) for s in presentes])
         destaques.append(bool(it["alertas"]))
 
     # Exclusão em dois passos (pergunta antes de apagar)
@@ -122,5 +129,5 @@ def _detalhe(app, nota_id):
         app.titulo(f"NF {nota['numero']}", f"Série {nota['serie'] or '—'}",
                    app.botao("Voltar", lambda e: app.ir("notas"), False), abrir_exclusao, pergunta),
         app.cartao(dados),
-        app.tabela(COLUNAS_DETALHE, linhas, destaques, "Esta nota não tem itens."),
+        app.tabela(COLUNAS_ITEM + presentes, linhas, destaques, "Esta nota não tem itens."),
     ], spacing=16)

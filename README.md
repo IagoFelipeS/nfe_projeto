@@ -1,10 +1,11 @@
 # Importador de NF-e
 
 Sistema desktop em Python ([Flet](https://flet.dev)) com banco de dados **SQLite** que lê os arquivos XML de
-Nota Fiscal Eletrônica e separa **todos os impostos de cada item** (ICMS, ICMS-ST, IPI, PIS, COFINS e os
-novos IBS/CBS da reforma tributária). Assim o usuário consegue cadastrar os produtos no sistema dele com a
-tributação certa. Na importação, o sistema também confere as notas e **aponta o que está errado**, tanto
-nas regras atuais quanto nas regras da **reforma tributária** (IBS/CBS).
+Nota Fiscal Eletrônica e separa **todos os impostos de cada item**: ICMS, FCP, ICMS-ST (com MVA), FCP-ST,
+DIFAL, ICMS desonerado, IPI, Imposto de Importação, PIS, COFINS e os novos IS, IBS e CBS da reforma
+tributária. Assim o usuário consegue cadastrar os produtos no sistema dele com a tributação certa. Na
+importação, o sistema também confere as notas e **aponta o que está errado**, tanto nas regras atuais
+quanto nas regras da **reforma tributária** (IBS/CBS).
 
 ## Pastas do sistema
 
@@ -20,6 +21,7 @@ nfe_projeto/
 │   ├── fornecedores.py          Tela 5 – Fornecedores (editar / excluir)
 │   ├── alertas.py               Tela 6 – Conferência (inconsistências)
 │   ├── relatorios.py            Tela 7 – Relatórios (totais por tributo e fornecedor)
+│   ├── conferencia.py           Regras de conferência gerais (ICMS, FCP, ST, DIFAL, IPI, PIS, COFINS)
 │   └── reforma.py               Regras de conferência da reforma tributária (IBS/CBS)
 ├── xmls_exemplo/              ← XMLs de NF-e fictícios para testar a importação
 ├── requirements.txt
@@ -36,7 +38,8 @@ python nfe_projeto/main.py
 (ou, dentro da pasta `nfe_projeto/`, `python main.py`)
 
 O sistema abre usando o banco `banco/nfe_importador.db`. Se o arquivo for apagado, ele é recriado vazio
-automaticamente na próxima execução.
+automaticamente na próxima execução. Um banco criado por uma versão anterior do sistema recebe as colunas
+novas automaticamente ao abrir.
 
 ## Banco de dados (SQLite)
 
@@ -47,10 +50,10 @@ Arquivo: `banco/nfe_importador.db`. São 8 tabelas com chaves primárias, chaves
 |---|---|---|
 | `fornecedores` | Emitentes das notas (CNPJ, nome, regime tributário) | pai de `notas` e `produtos` |
 | `notas` | Cabeçalho da NF-e (chave de acesso, número, série, data, total) | filha de `fornecedores` |
-| `produtos` | Catálogo de produtos por fornecedor (código, EAN, NCM, CEST, cClassTrib, status) | filha de `fornecedores` |
-| `itens_nota` | Cada item de cada nota (CFOP, cClassTrib, quantidade, valores) | filha de `notas` e `produtos` |
-| `tributos` | Catálogo fixo: ICMS, ICMS-ST, IPI, PIS, COFINS, IBS, CBS | pai de `impostos_item` |
-| `impostos_item` | Imposto de cada item (CST/CSOSN, base, alíquota, valor) | filha de `itens_nota` e `tributos` |
+| `produtos` | Catálogo de produtos por fornecedor (código, EAN, NCM, CEST, origem, cClassTrib, status) | filha de `fornecedores` |
+| `itens_nota` | Cada item de cada nota (CFOP, origem, cClassTrib, benefício fiscal, quantidade, valores, frete, seguro, desconto, outras despesas) | filha de `notas` e `produtos` |
+| `tributos` | Catálogo fixo dos 14 tributos (ver tabela abaixo) | pai de `impostos_item` |
+| `impostos_item` | Imposto de cada item (CST/CSOSN, modalidade da base, base, redução da base, MVA, alíquota, valor) | filha de `itens_nota` e `tributos` |
 | `alertas` | Inconsistências encontradas em cada item | filha de `itens_nota` |
 | `importacoes` | Histórico de cada tentativa de importação (ok, duplicada, erro) | referencia `notas` |
 
@@ -59,6 +62,25 @@ Regras de integridade que aparecem no uso:
 - Não é possível excluir um fornecedor que tem notas ou produtos (a chave estrangeira impede).
 - A chave de acesso da nota é `UNIQUE`, então a mesma nota não é importada duas vezes.
 
+## Impostos lidos do XML
+
+| Tributo | O que é extraído |
+|---|---|
+| **ICMS** | Origem, CST/CSOSN, modalidade da base, base, redução da base, alíquota, valor, crédito do Simples, diferimento |
+| **FCP** | Fundo de Combate à Pobreza sobre o ICMS próprio: base, alíquota e valor |
+| **ICMS-ST** | Modalidade, **MVA**, redução da base ST, base, alíquota e valor. Também lê a ST retida anteriormente (CST 60 / CSOSN 500) |
+| **FCP-ST** | FCP retido por substituição (ou retido anteriormente) |
+| **DIFAL** | Venda interestadual a consumidor final: base, alíquota interna do destino, alíquota interestadual, partilha e valor |
+| **FCP-DIFAL** | FCP devido à UF de destino |
+| **ICMS desonerado** | Valor e motivo da desoneração |
+| **IPI** | CST, enquadramento, base, alíquota, valor (também IPI por unidade) |
+| **II** | Imposto de Importação: base, valor, despesas aduaneiras e IOF |
+| **PIS / COFINS** | CST, base, alíquota, valor (também por quantidade) |
+| **IS** | Imposto Seletivo da reforma: CST, cClassTrib, base, alíquota, valor |
+| **IBS / CBS** | CST, cClassTrib, base, alíquotas estadual, municipal e da CBS, redução e alíquota efetiva |
+
+No detalhe da nota aparecem só as colunas dos tributos que existem naquela nota.
+
 ## As 7 telas
 
 1. **Painel**: indicadores (notas importadas, produtos, pendentes de cadastro, alertas em aberto,
@@ -66,11 +88,12 @@ Regras de integridade que aparecem no uso:
 2. **Importar XML**: seleciona um ou vários XMLs, importa tudo numa transação e mostra o resultado
    de cada arquivo (importada, já importada ou erro) e o histórico de importações.
 3. **Notas fiscais**: lista das notas com situação (OK ou "p/ revisar"). Ao abrir uma nota, aparecem
-   os dados do emitente e uma tabela com o cClassTrib e os impostos de cada item. O botão "Excluir
-   nota" pede confirmação.
+   os dados do emitente e uma tabela com a origem, o cClassTrib e todos os impostos de cada item
+   (com MVA e redução da base). O botão "Excluir nota" pede confirmação.
 4. **Produtos**: busca por descrição, código, NCM, EAN ou cClassTrib e filtro Pendentes/Cadastrados.
-   A **ficha do produto** permite editar os dados (incluindo o cClassTrib) e marcar como cadastrado, e
-   mostra a tributação atual e o histórico de compras.
+   A **ficha do produto** permite editar os dados de cadastro (NCM, CEST, origem, cClassTrib...) e
+   marcar como cadastrado. Também mostra a tributação completa da última compra (modalidade, base,
+   redução, MVA, alíquota, valor) e o histórico de compras com frete, seguro, desconto e outras despesas.
 5. **Fornecedores**: lista com CNPJ, regime tributário, quantidade de notas e de produtos. Permite
    editar o nome e excluir (só os fornecedores sem vínculos).
 6. **Conferência**: alertas gerados automaticamente na importação, separados em **REFORMA** e
@@ -80,12 +103,21 @@ Regras de integridade que aparecem no uso:
 
 ## O que o sistema confere
 
-**Regras gerais** (em `importar.py`)
-- NCM ausente ou sem 8 dígitos
+**Regras gerais** (em `conferencia.py`)
+- NCM ausente ou sem 8 dígitos; origem da mercadoria fora de 0 a 8
 - Valor total do item diferente de quantidade × valor unitário
 - CST × CSOSN errado para o regime do emitente (Simples Nacional usa CSOSN)
-- ICMS, IPI, PIS ou COFINS com base × alíquota diferente do valor informado
-- NCM diferente do que já estava cadastrado para o produto
+- ICMS, FCP, FCP-DIFAL, IPI, PIS ou COFINS com base × alíquota diferente do valor informado
+- **Base do ICMS** diferente de produto + frete + seguro + outras despesas − desconto (com a redução da
+  base, quando houver)
+- **Alíquota interestadual** (CFOP 6xxx) diferente de 4%, 7% ou 12%, e **produto importado** (origem 1, 2,
+  3 ou 8) fora dos 4% da Resolução do Senado 13/2012
+- **ICMS-ST**: base diferente de valor da operação (+ IPI) com a **MVA** (e a redução da base ST);
+  valor diferente de base ST × alíquota − ICMS próprio
+- **FCP**: alíquota acima do limite de 2% (ADCT art. 82); FCP-ST diferente de base × alíquota − FCP próprio
+- **DIFAL**: alíquota interestadual inválida ou diferente da alíquota do ICMS do item; partilha diferente
+  de 100% para a UF de destino (regra desde 2019)
+- NCM ou origem diferente do que já estava cadastrado para o produto
 
 **Reforma tributária: IBS e CBS** (em `reforma.py`, conforme o leiaute da NT 2025.002-RTC e a LC 214/2025)
 - Emitente do **regime normal** sem o grupo IBS/CBS em nota de 2026 em diante. Simples Nacional e MEI
@@ -99,9 +131,10 @@ Regras de integridade que aparecem no uso:
 - Totais da nota (grupo `IBSCBSTot`) diferentes da soma dos itens
 - cClassTrib diferente do que já estava cadastrado para o produto
 
-As regras da reforma ainda mudam por nota técnica. Por isso os alertas **não bloqueiam** a importação:
-eles servem para a conferência humana. Notas com diferimento ou compra governamental não têm os
-valores conferidos, porque o cálculo nesses casos é diferente.
+Os alertas **não bloqueiam** a importação: eles servem para a conferência humana, porque as regras (em
+especial as da reforma e as de cada estado) mudam com frequência. O valor do DIFAL em si não é
+recalculado, porque a fórmula varia por estado (base única ou base dupla). Notas com diferimento ou compra
+governamental não têm os valores do IBS/CBS conferidos, porque o cálculo nesses casos é diferente.
 
 ## Dados de demonstração
 
@@ -115,7 +148,8 @@ são fictícios** e foram criados só para teste:
 | `03_valeforte_nf30871.xml` | Indústria com IPI e IBS/CBS: **ICMS com valor errado**, **total do item errado**, **cClassTrib que não pertence ao CST**, **CBS de 1,2% (teste é 0,9%)** e **total da CBS da nota errado** |
 | `04_aurora_nf1588.xml` | Segunda compra da distribuidora: arroz e feijão **corretos** pela reforma (CST 200, cClassTrib 200003, redução de 100%), **NCM alterado** do refrigerante e **cClassTrib do arroz diferente do cadastro** |
 | `05_arquivo_invalido.xml` | XML que não é NF-e (mostra o tratamento de erro) |
-| `06_horizonte_nf9214.xml` | Distribuidora de bebidas do regime normal **sem o grupo IBS/CBS** |
+| `06_horizonte_nf9214.xml` | Distribuidora de bebidas do RJ **sem o grupo IBS/CBS**: FCP de 2%, frete e desconto compondo a base, **FCP de 3%** e cerveja com ICMS-ST, FCP-ST e **base ST calculada com MVA errada** |
+| `07_eletrosul_nf5530.xml` | Venda interestadual a consumidor final com **DIFAL** e FCP do destino: luminária importada a 4% (correta), **ventilador importado a 12%** e **DIFAL com alíquota interestadual diferente do ICMS** |
 
 Os itens em **negrito** geram alertas na tela de Conferência. O `01` foi importado duas vezes para
 mostrar a detecção de nota duplicada no histórico.
@@ -125,15 +159,16 @@ mostrar a detecção de nota duplicada no histórico.
 1. Mostrar as pastas do projeto e abrir o `banco/nfe_importador.db` (ex.: no DB Browser for SQLite)
    para mostrar as 8 tabelas.
 2. Rodar o sistema e mostrar o **Painel** com os indicadores.
-3. **Notas fiscais**: abrir a NF 30871 e mostrar os impostos por item e os itens marcados "REVISAR"
-   (passar o mouse no selo mostra o motivo).
-4. **Conferência**: filtrar "Reforma tributária" e explicar cada alerta do IBS/CBS (cesta básica,
-   cClassTrib × CST, alíquota de teste, nota sem IBS/CBS). Resolver um e mostrar que ele vai para
-   "Resolvidos".
-5. **Produtos**: filtrar Pendentes e abrir a ficha do arroz (2 compras com preços diferentes). Mostrar
-   o alerta de cClassTrib diferente do cadastro, corrigir o cClassTrib para 200003 na ficha e salvar.
+3. **Notas fiscais**: abrir a NF 9214 e mostrar ICMS, FCP, ICMS-ST com MVA e FCP-ST de cada item. Depois
+   abrir a NF 5530 e mostrar o DIFAL. Os itens marcados "REVISAR" mostram o motivo ao passar o mouse.
+4. **Conferência**: filtrar "Regras gerais" (FCP, ST, alíquota interestadual, DIFAL) e depois "Reforma
+   tributária" (cesta básica, cClassTrib × CST, alíquota de teste, nota sem IBS/CBS). Resolver um alerta
+   e mostrar que ele vai para "Resolvidos".
+5. **Produtos**: abrir a ficha da cerveja para mostrar a tributação completa (modalidade, MVA, base,
+   alíquota). Abrir a ficha do arroz (2 compras com preços diferentes), corrigir o cClassTrib para
+   200003 e salvar.
 6. **Fornecedores**: tentar excluir um fornecedor e mostrar o bloqueio pela chave estrangeira.
-7. **Relatórios**: totais por tributo e por fornecedor.
+7. **Relatórios**: totais por tributo (incluindo FCP, ST e DIFAL) e por fornecedor.
 8. **Importar XML**: excluir uma nota na tela de Notas e importá-la de novo pela pasta
    `xmls_exemplo/`. Importar outra vez para mostrar "Já importada" e importar o
    `05_arquivo_invalido.xml` para mostrar o erro tratado.
