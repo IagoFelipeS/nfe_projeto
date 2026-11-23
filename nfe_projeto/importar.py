@@ -1,9 +1,9 @@
 """Tela 2 — Importar XML. Também concentra o banco de dados e a leitura da NF-e.
 
 Escopo deste arquivo:
-  1. BANCO: esquema SQLite (9 tabelas: 8 ligadas por PKs e FKs 1:N + configuracoes) e conexão.
+  1. BANCO: esquema SQLite (8 tabelas, PKs e FKs 1:N) e conexão.
   2. XML: lê a NF-e e extrai produto + impostos de cada item (ICMS, FCP, ICMS-ST, FCP-ST, DIFAL,
-     ICMS desonerado, IPI, II, PIS, COFINS, IS, IBS e CBS), com MVA, redução de base e modalidade.
+     FCP-DIFAL, IPI, PIS, COFINS, IBS e CBS), com MVA, redução de base e modalidade.
   3. IMPORTAÇÃO: grava tudo em uma transação e registra o histórico. As regras que geram os alertas
      ficam em conferencia.py (gerais) e reforma.py (IBS/CBS).
   4. TELA: escolher os XMLs e mostrar o resultado e o histórico.
@@ -34,12 +34,9 @@ TRIBUTOS = [
     ("FCP-ST", "Fundo de Combate à Pobreza retido por Substituição Tributária"),
     ("DIFAL", "ICMS diferencial de alíquota devido à UF de destino"),
     ("FCP-DIFAL", "Fundo de Combate à Pobreza devido à UF de destino"),
-    ("ICMS-Deson", "ICMS desonerado"),
     ("IPI", "Imposto sobre Produtos Industrializados"),
-    ("II", "Imposto de Importação"),
     ("PIS", "Programa de Integração Social"),
     ("COFINS", "Contribuição para o Financiamento da Seguridade Social"),
-    ("IS", "Imposto Seletivo (reforma tributária)"),
     ("IBS", "Imposto sobre Bens e Serviços (reforma tributária)"),
     ("CBS", "Contribuição sobre Bens e Serviços (reforma tributária)"),
 ]
@@ -100,8 +97,8 @@ CREATE TABLE IF NOT EXISTS produtos (
     unidade        TEXT NOT NULL DEFAULT '',
     cclasstrib     TEXT NOT NULL DEFAULT '',    -- classificação tributária do IBS/CBS (reforma)
     origem         TEXT NOT NULL DEFAULT '',    -- origem da mercadoria (0 a 8)
-    margem         REAL,                        -- lucro desejado (% do preço); vazio = padrão da empresa
-    icms_venda     REAL,                        -- ICMS (+FCP) na venda (%); vazio = padrão da empresa
+    impostos_venda REAL,                        -- % de impostos sobre a venda (preço de venda sugerido)
+    margem         REAL,                        -- % de lucro desejado sobre o preço
     preco_venda    REAL,                        -- preço de venda calculado e salvo pelo usuário
     status      TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente', 'cadastrado')),
     UNIQUE (fornecedor_id, codigo)
@@ -162,18 +159,6 @@ CREATE TABLE IF NOT EXISTS importacoes (
     nota_id    INTEGER REFERENCES notas(id) ON DELETE SET NULL
 );
 
--- Parâmetros da empresa usuária para a formação do preço de venda (sempre uma única linha, id = 1)
-CREATE TABLE IF NOT EXISTS configuracoes (
-    id                INTEGER PRIMARY KEY CHECK (id = 1),
-    regime            TEXT NOT NULL DEFAULT 'simples' CHECK (regime IN ('simples', 'presumido', 'real')),
-    aliquota_simples  REAL NOT NULL DEFAULT 8.0,
-    icms_venda        REAL NOT NULL DEFAULT 18.0,
-    irpj_csll         REAL NOT NULL DEFAULT 2.28,
-    despesas          REAL NOT NULL DEFAULT 15.0,
-    margem            REAL NOT NULL DEFAULT 10.0,
-    aliquota_reforma  REAL NOT NULL DEFAULT 26.5
-);
-
 CREATE INDEX IF NOT EXISTS idx_notas_fornecedor ON notas(fornecedor_id);
 CREATE INDEX IF NOT EXISTS idx_itens_nota ON itens_nota(nota_id);
 CREATE INDEX IF NOT EXISTS idx_itens_produto ON itens_nota(produto_id);
@@ -184,7 +169,7 @@ CREATE INDEX IF NOT EXISTS idx_alertas_item ON alertas(item_id);
 
 TEXTO = "TEXT NOT NULL DEFAULT ''"
 COLUNAS_NOVAS = {
-    "produtos": [("cclasstrib", TEXTO), ("origem", TEXTO), ("margem", "REAL"), ("icms_venda", "REAL"),
+    "produtos": [("cclasstrib", TEXTO), ("origem", TEXTO), ("impostos_venda", "REAL"), ("margem", "REAL"),
                  ("preco_venda", "REAL")],
     "itens_nota": [("cclasstrib", TEXTO), ("origem", TEXTO), ("cbenef", TEXTO), ("frete", "REAL"),
                    ("seguro", "REAL"), ("desconto", "REAL"), ("outras", "REAL")],
@@ -206,7 +191,6 @@ def conectar(caminho=BANCO):
             if nome not in existentes:
                 conn.execute(f"ALTER TABLE {tabela} ADD COLUMN {nome} {tipo}")
     conn.executemany("INSERT OR IGNORE INTO tributos (sigla, nome) VALUES (?, ?)", TRIBUTOS)
-    conn.execute("INSERT OR IGNORE INTO configuracoes (id) VALUES (1)")
     conn.commit()
     return conn
 
@@ -362,10 +346,9 @@ def _tags(grupo):
     return {filho.tag: (filho.text or "").strip() for filho in grupo}
 
 
-def _imposto(sigla, cst="", base="", aliq="", valor="", detalhe="", modalidade="", reducao="", mva="",
-             retido=False):
+def _imposto(sigla, cst="", base="", aliq="", valor="", detalhe="", modalidade="", reducao="", mva=""):
     return {"sigla": sigla, "cst": cst, "base": base, "aliq": aliq, "valor": valor, "detalhe": detalhe,
-            "modalidade": modalidade, "reducao": reducao, "mva": mva, "retido": retido}
+            "modalidade": modalidade, "reducao": reducao, "mva": mva}
 
 
 def _impostos(imp, ibs):
@@ -381,12 +364,6 @@ def _impostos(imp, ibs):
                 partes.append(f"{br(t(ipi, 'qUnid'), 4)} un. × R$ {br(t(ipi, 'vUnid'), 4)}")
             lista.append(_imposto("IPI", t(ipi, "CST"), t(ipi, "vBC"), t(ipi, "pIPI"), t(ipi, "vIPI"),
                                   " · ".join(partes)))
-        ii = imp.find("II")
-        if ii is not None:
-            partes = [f"despesas aduaneiras R$ {br(t(ii, 'vDespAdu'))}"] if t(ii, "vDespAdu") else []
-            if t(ii, "vIOF"):
-                partes.append(f"IOF R$ {br(t(ii, 'vIOF'))}")
-            lista.append(_imposto("II", "", t(ii, "vBC"), "", t(ii, "vII"), " · ".join(partes)))
         for sigla in ("PIS", "COFINS"):
             grupo = imp.find(sigla)
             if t(grupo, "CST"):
@@ -395,13 +372,12 @@ def _impostos(imp, ibs):
                     detalhe = f"{br(t(grupo, 'qBCProd'), 4)} un. × R$ {br(t(grupo, 'vAliqProd'), 4)}"
                 lista.append(_imposto(sigla, t(grupo, "CST"), t(grupo, "vBC"), t(grupo, f"p{sigla}"),
                                       t(grupo, f"v{sigla}"), detalhe))
-        lista += _imposto_seletivo(imp.find("IS"))
     lista += _ibs_cbs(ibs)
     return lista
 
 
 def _icms(icms):
-    """ICMS próprio, FCP, ICMS-ST, FCP-ST e ICMS desonerado do grupo ICMSxx."""
+    """ICMS próprio, FCP, ICMS-ST e FCP-ST do grupo ICMSxx."""
     if icms is None or not len(icms):
         return []
     g = icms[0]
@@ -425,22 +401,8 @@ def _icms(icms):
         lista.append(_imposto("ICMS-ST", cst, t(g, "vBCST"), t(g, "pICMSST"), t(g, "vICMSST"),
                               modalidade=MODALIDADES_BCST.get(t(g, "modBCST"), ""), reducao=t(g, "pRedBCST"),
                               mva=t(g, "pMVAST")))
-    elif t(g, "vBCSTRet") or t(g, "vICMSSTRet"):  # ST cobrada anteriormente (ICMS60, CSOSN 500)
-        detalhe = "retido anteriormente"
-        if t(g, "vICMSSubstituto"):
-            detalhe += f" · ICMS do substituto R$ {br(t(g, 'vICMSSubstituto'))}"
-        lista.append(_imposto("ICMS-ST", cst, t(g, "vBCSTRet"), t(g, "pST"), t(g, "vICMSSTRet"), detalhe,
-                              retido=True))
-
     if t(g, "vBCFCPST") or t(g, "pFCPST") or t(g, "vFCPST"):
         lista.append(_imposto("FCP-ST", cst, t(g, "vBCFCPST"), t(g, "pFCPST"), t(g, "vFCPST")))
-    elif t(g, "vFCPSTRet"):
-        lista.append(_imposto("FCP-ST", cst, t(g, "vBCFCPSTRet"), t(g, "pFCPSTRet"), t(g, "vFCPSTRet"),
-                              "retido anteriormente", retido=True))
-
-    if t(g, "vICMSDeson"):
-        lista.append(_imposto("ICMS-Deson", cst, valor=t(g, "vICMSDeson"),
-                              detalhe=f"motivo {t(g, 'motDesICMS') or '—'}"))
     return lista
 
 
@@ -457,17 +419,6 @@ def _difal(d):
         lista.append(_imposto("FCP-DIFAL", "", t(d, "vBCFCPUFDest") or t(d, "vBCUFDest"), t(d, "pFCPUFDest"),
                               t(d, "vFCPUFDest")))
     return lista
-
-
-def _imposto_seletivo(grupo):
-    """Imposto Seletivo (reforma tributária): bebidas, fumo, veículos etc."""
-    if grupo is None:
-        return []
-    partes = [f"cClassTrib {t(grupo, 'cClassTribIS')}"] if t(grupo, "cClassTribIS") else []
-    if t(grupo, "pISEspec"):
-        partes.append(f"alíquota específica R$ {br(t(grupo, 'pISEspec'), 4)}")
-    return [_imposto("IS", t(grupo, "CSTIS"), t(grupo, "vBCIS"), t(grupo, "pIS"), t(grupo, "vIS"),
-                     " · ".join(partes))]
 
 
 def _ibs_cbs(g):

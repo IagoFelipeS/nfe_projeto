@@ -161,24 +161,6 @@ def vazio(texto):
     return cartao(ft.Text(texto, color=Cor.MUTED))
 
 
-def resumo_imposto(imposto):
-    """'CST 10 · MVA 40,00% · 18,00% · R$ 25,88' a partir de uma linha de impostos_item ('—' se não existir)."""
-    if not imposto:
-        return "—"
-    partes = []
-    if imposto["cst"]:
-        partes.append("CST " + imposto["cst"])
-    if imposto.get("mva") is not None:
-        partes.append("MVA " + percentual(imposto["mva"]))
-    if imposto.get("reducao_base") is not None:
-        partes.append("red. " + percentual(imposto["reducao_base"]))
-    if imposto["aliquota"] is not None:
-        partes.append(percentual(imposto["aliquota"]))
-    if imposto["valor"] is not None:
-        partes.append(dinheiro(imposto["valor"]))
-    return " · ".join(partes) or "—"
-
-
 def tabela(colunas, linhas, destaques=None, texto_vazio="Nenhum registro encontrado."):
     """Tabela em cartão. `linhas` é uma lista de listas (texto ou controle em cada célula).
     `destaques` é uma lista de True/False (uma por linha) para pintar a linha de âmbar."""
@@ -222,7 +204,6 @@ class Aplicativo:
     selo_produto = staticmethod(selo_produto)
     campo = staticmethod(campo)
     vazio = staticmethod(vazio)
-    resumo_imposto = staticmethod(resumo_imposto)
     tabela = staticmethod(tabela)
 
     def __init__(self, page, conn):
@@ -245,6 +226,28 @@ class Aplicativo:
         """Executa INSERT/UPDATE/DELETE com commit. Devolve o id da linha inserida."""
         with self.conn:
             return self.conn.execute(sql, params).lastrowid
+
+    # ---- abas (usadas na ficha do produto)
+
+    def abas(self, itens):
+        """itens = [(rótulo, controle)]. Mostra uma linha de abas e só o conteúdo da aba escolhida."""
+        conteudos = [conteudo for _, conteudo in itens]
+        botoes = [ft.Container(ft.Text(rotulo), padding=12, border_radius=8)
+                  for rotulo, _ in itens]
+
+        def mostrar(escolhida, atualizar=True):
+            for i, (botao_aba, conteudo) in enumerate(zip(botoes, conteudos)):
+                ativa = i == escolhida
+                conteudo.visible = ativa
+                botao_aba.bgcolor = Cor.AZUL_SUAVE if ativa else Cor.CARTAO
+                botao_aba.content.weight = "bold" if ativa else None
+            if atualizar:
+                self.page.update()
+
+        for i, botao_aba in enumerate(botoes):
+            botao_aba.on_click = lambda e, i=i: mostrar(i)
+        mostrar(0, atualizar=False)
+        return ft.Column([ft.Row(botoes, spacing=8)] + conteudos, spacing=16)
 
     # ---- navegação
 

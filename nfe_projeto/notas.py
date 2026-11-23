@@ -1,15 +1,13 @@
-"""Tela 3 — Notas fiscais: lista das notas importadas e, ao abrir uma nota, o detalhe com
-todos os impostos de cada item (ICMS, FCP, ICMS-ST, FCP-ST, DIFAL, IPI, II, PIS, COFINS, IS, IBS e CBS).
+"""Tela 3 — Notas fiscais: lista das notas importadas e, ao abrir uma nota, o detalhe com os itens.
+Ao clicar em "Impostos" num item, aparece embaixo o quadro com todos os impostos dele (ICMS, FCP,
+ICMS-ST, FCP-ST, DIFAL, IPI, PIS, COFINS, IBS e CBS) e os alertas da conferência.
 
 Escopo: consultas de notas/itens/impostos + as duas visões (lista e detalhe) da mesma tela.
-No detalhe, só aparecem as colunas dos tributos que existem na nota aberta.
 """
 import flet as ft
 
 from nfe_projeto.importar import ORIGENS, TRIBUTOS
 
-COLUNAS_ITEM = ["Status", "#", "Código", "Descrição", "NCM", "CFOP", "Orig.", "cClassTrib", "Qtd",
-                "Valor total"]
 SIGLAS = [sigla for sigla, _ in TRIBUTOS]  # ordem de exibição dos tributos
 
 
@@ -92,17 +90,25 @@ def _detalhe(app, nota_id):
         return app.vazio("Nota não encontrada.")
 
     itens = itens_da_nota(app, nota_id)
-    presentes = [s for s in SIGLAS if any(s in it["impostos"] for it in itens)]  # só tributos desta nota
+    quadro = ft.Container()  # impostos do item escolhido
+
+    def mostrar_impostos(item, atualizar=True):
+        quadro.content = _quadro_impostos(app, item)
+        if atualizar:
+            app.page.update()
+
     linhas, destaques = [], []
     for it in itens:
-        descricao = ft.TextButton(it["descricao"][:38], tooltip="Abrir ficha do produto",
+        descricao = ft.TextButton(it["descricao"][:40], tooltip="Abrir ficha do produto",
                                   on_click=lambda e, p=it["produto_id"]: app.ir("produtos", produto_id=p))
-        origem = ft.Text(it["origem"] or "—", size=13, tooltip=ORIGENS.get(it["origem"]))
-        linhas.append([app.selo_conferencia(it["alertas"]), str(it["numero_item"]), it["codigo"], descricao,
-                       it["ncm"], it["cfop"], origem, it["cclasstrib"] or "—", app.quantidade(it["quantidade"]),
-                       app.dinheiro(it["valor_total"])]
-                      + [app.resumo_imposto(it["impostos"].get(s)) for s in presentes])
+        total_impostos = sum(x["valor"] or 0 for x in it["impostos"].values())
+        linhas.append([app.selo_conferencia(it["alertas"]), str(it["numero_item"]), descricao, it["ncm"],
+                       it["cfop"], app.quantidade(it["quantidade"]), app.dinheiro(it["valor_total"]),
+                       app.dinheiro(total_impostos),
+                       app.botao("Impostos", lambda e, x=it: mostrar_impostos(x), False)])
         destaques.append(bool(it["alertas"]))
+    if itens:  # começa mostrando o primeiro item com alerta (ou o primeiro item)
+        mostrar_impostos(next((it for it in itens if it["alertas"]), itens[0]), atualizar=False)
 
     # Exclusão em dois passos (pergunta antes de apagar)
     pergunta = ft.Row([ft.Text("Excluir esta nota e seus itens?"),
@@ -129,5 +135,25 @@ def _detalhe(app, nota_id):
         app.titulo(f"NF {nota['numero']}", f"Série {nota['serie'] or '—'}",
                    app.botao("Voltar", lambda e: app.ir("notas"), False), abrir_exclusao, pergunta),
         app.cartao(dados),
-        app.tabela(COLUNAS_ITEM + presentes, linhas, destaques, "Esta nota não tem itens."),
+        app.tabela(["Status", "#", "Descrição", "NCM", "CFOP", "Qtd", "Valor total", "Impostos destacados", ""],
+                   linhas, destaques, "Esta nota não tem itens."),
+        quadro,
     ], spacing=16)
+
+
+def _quadro_impostos(app, item):
+    """Quadro com os alertas e todos os impostos de um item da nota."""
+    origem = item["origem"] or "—"
+    if item["origem"] in ORIGENS:
+        origem += f" ({ORIGENS[item['origem']]})"
+    cabecalho = [ft.Text(f"Item {item['numero_item']} — {item['descricao']}", size=16, weight="bold"),
+                 ft.Text(f"Origem {origem}  ·  cClassTrib {item['cclasstrib'] or '—'}", color=app.cor.MUTED)]
+    alertas = [ft.Text("⚠ " + m.removeprefix("Reforma: "), color=app.cor.AMBAR, size=13) for m in item["alertas"]]
+    impostos = [item["impostos"][s] for s in SIGLAS if s in item["impostos"]]
+    tabela = app.tabela(["Tributo", "CST", "Base de cálculo", "Redução da base", "MVA", "Alíquota", "Valor",
+                         "Detalhes"],
+                        [[x["sigla"], x["cst"] or "—", app.dinheiro(x["base"]), app.percentual(x["reducao_base"]),
+                          app.percentual(x["mva"]), app.percentual(x["aliquota"]), app.dinheiro(x["valor"]),
+                          x["detalhe"] or "—"] for x in impostos],
+                        texto_vazio="Sem impostos destacados neste item.")
+    return app.cartao(ft.Column(cabecalho + alertas + [tabela], spacing=8))

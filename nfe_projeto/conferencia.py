@@ -120,7 +120,7 @@ def _fcp(item):
                         f"(ADCT art. 82)")
 
     fcp_st = _imposto(item, "FCP-ST")
-    if fcp_st and not fcp_st["retido"]:
+    if fcp_st:
         base, aliq, valor = _d(fcp_st["base"]), _d(fcp_st["aliq"]), _d(fcp_st["valor"])
         proprio = _d((_imposto(item, "FCP") or {}).get("valor")) or Decimal(0)
         if None not in (base, aliq, valor) and _difere(valor, base * aliq / 100 - proprio):
@@ -133,7 +133,7 @@ def _substituicao(item):
     """ICMS-ST: valor = base ST × alíquota ST − ICMS próprio; base ST = operação (+IPI) × (1 + MVA)."""
     msgs, ic = [], item["icms"]
     st = _imposto(item, "ICMS-ST")
-    if not st or st["retido"]:
+    if not st:
         return msgs
     base_st, aliq_st, valor_st = _d(st["base"]), _d(st["aliq"]), _d(st["valor"])
     proprio = _d(ic.get("vICMS"))
