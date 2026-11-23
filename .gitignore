@@ -1,0 +1,39 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# ---- Ambiente virtual ----
+.venv/
+venv/
+env/
+
+# ---- Segredos / configuração local ----
+.env
+*.env
+config_local.py
+
+# ---- Banco de dados ----
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ---- Dados de NF-e (XMLs importados) ----
+xmls/
+notas/
+*.xml
+
+# ---- Relatórios gerados ----
+*.xlsx
+*.csv
+*.pdf
+
+# ---- Editor / Sistema ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.lnk
