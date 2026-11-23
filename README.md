@@ -78,6 +78,8 @@ Regras de integridade que aparecem no uso:
 
 ## As 7 telas
 
+Prints de cada tela com a explicação detalhada: [docs/TELAS.md](docs/TELAS.md).
+
 1. **Painel**: indicadores (notas importadas, produtos, pendentes de cadastro, alertas em aberto,
    alertas da reforma) e as últimas notas, com atalho para abrir cada uma.
 2. **Importar XML**: seleciona um ou vários XMLs, importa tudo numa transação e mostra o resultado

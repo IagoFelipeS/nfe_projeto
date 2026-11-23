@@ -38,8 +38,8 @@ def construir(app):
     def montar():
         resolvidos = estado["resolvidos"]
         alertas = listar_alertas(app, resolvidos, estado["tipo"])
-        linhas = [[selo_tipo(a["mensagem"]), a["nf"], str(a["numero_item"]), a["descricao"][:40], a["fornecedor"],
-                   a["mensagem"].removeprefix(PREFIXO_REFORMA),
+        linhas = [[selo_tipo(a["mensagem"]), a["nf"], str(a["numero_item"]), a["descricao"][:32],
+                   ft.Text(a["mensagem"].removeprefix(PREFIXO_REFORMA), size=13, width=520),
                    ft.Row([app.botao("Reabrir" if resolvidos else "Resolver",
                                      lambda e, i=a["id"]: marcar(i, not resolvidos), False),
                            app.botao("Ver nota", lambda e, n=a["nota_id"]: app.ir("notas", nota_id=n), False)])]
@@ -47,9 +47,9 @@ def construir(app):
         nomes = {"": "todos os tipos", "reforma": "reforma tributária", "geral": "regras gerais"}
         rotulo.value = (f"{len(alertas)} alerta(s) {'resolvido(s)' if resolvidos else 'em aberto'} · "
                         f"{nomes[estado['tipo']]}")
-        lista.content = app.tabela(["Tipo", "NF", "Item", "Produto", "Fornecedor", "Problema", ""], linhas,
+        lista.content = app.tabela(["Tipo", "NF", "Item", "Produto", "Problema", ""], linhas,
                                    texto_vazio="Nenhum alerta resolvido." if resolvidos
-                                   else "Nenhum alerta em aberto.")
+                                   else "Nenhum alerta em aberto.", altura_linha=64)
 
     def marcar(alerta_id, resolvido):
         app.executar("UPDATE alertas SET resolvido = ? WHERE id = ?", (1 if resolvido else 0, alerta_id))

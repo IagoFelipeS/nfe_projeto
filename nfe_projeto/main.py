@@ -161,9 +161,10 @@ def vazio(texto):
     return cartao(ft.Text(texto, color=Cor.MUTED))
 
 
-def tabela(colunas, linhas, destaques=None, texto_vazio="Nenhum registro encontrado."):
+def tabela(colunas, linhas, destaques=None, texto_vazio="Nenhum registro encontrado.", altura_linha=48):
     """Tabela em cartão. `linhas` é uma lista de listas (texto ou controle em cada célula).
-    `destaques` é uma lista de True/False (uma por linha) para pintar a linha de âmbar."""
+    `destaques` é uma lista de True/False (uma por linha) para pintar a linha de âmbar.
+    `altura_linha` maior permite textos que quebram em duas linhas (usado na Conferência)."""
     if not linhas:
         return vazio(texto_vazio)
     destaques = destaques or [False] * len(linhas)
@@ -172,7 +173,8 @@ def tabela(colunas, linhas, destaques=None, texto_vazio="Nenhum registro encontr
     for celulas, destacar in zip(linhas, destaques):
         controles = [ft.DataCell(ft.Text(c, size=13) if isinstance(c, str) else c) for c in celulas]
         corpo.append(ft.DataRow(controles, color=Cor.LINHA_ALERTA if destacar else None))
-    tab = ft.DataTable(columns=cabecalho, rows=corpo, heading_row_height=44, data_row_min_height=48,
+    tab = ft.DataTable(columns=cabecalho, rows=corpo, heading_row_height=44, data_row_min_height=altura_linha,
+                       data_row_max_height=altura_linha,
                        column_spacing=22, divider_thickness=0.5)
     return cartao(ft.Row([tab], scroll=ft.ScrollMode.AUTO))
 
@@ -210,7 +212,7 @@ class Aplicativo:
         self.page = page
         self.conn = conn  # conexão SQLite compartilhada por todas as telas
         self.menu = ft.Column(spacing=4)
-        self.area = ft.Container(expand=True, padding=24)
+        self.area = ft.Container(expand=True, padding=24, bgcolor=Cor.FUNDO)
 
         # O seletor de arquivos é registrado de formas diferentes no Flet 1.x e no 0.x
         self.seletor = ft.FilePicker()
