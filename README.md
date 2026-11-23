@@ -5,7 +5,8 @@ Nota Fiscal Eletrônica e separa **todos os impostos de cada item**: ICMS, FCP, 
 DIFAL, ICMS desonerado, IPI, Imposto de Importação, PIS, COFINS e os novos IS, IBS e CBS da reforma
 tributária. Assim o usuário consegue cadastrar os produtos no sistema dele com a tributação certa. Na
 importação, o sistema também confere as notas e **aponta o que está errado**, tanto nas regras atuais
-quanto nas regras da **reforma tributária** (IBS/CBS).
+quanto nas regras da **reforma tributária** (IBS/CBS). Para cada produto, sugere o **preço de venda**
+com lucro, hoje e numa estimativa depois da reforma.
 
 ## Pastas do sistema
 
@@ -22,7 +23,8 @@ nfe_projeto/
 │   ├── alertas.py               Tela 6 – Conferência (inconsistências)
 │   ├── relatorios.py            Tela 7 – Relatórios (totais por tributo e fornecedor)
 │   ├── conferencia.py           Regras de conferência gerais (ICMS, FCP, ST, DIFAL, IPI, PIS, COFINS)
-│   └── reforma.py               Regras de conferência da reforma tributária (IBS/CBS)
+│   ├── reforma.py               Regras de conferência da reforma tributária (IBS/CBS)
+│   └── precificacao.py          Cálculo do preço de venda (hoje e após a reforma)
 ├── xmls_exemplo/              ← XMLs de NF-e fictícios para testar a importação
 ├── requirements.txt
 └── README.md
@@ -43,19 +45,20 @@ novas automaticamente ao abrir.
 
 ## Banco de dados (SQLite)
 
-Arquivo: `banco/nfe_importador.db`. São 8 tabelas com chaves primárias, chaves estrangeiras
-(`PRAGMA foreign_keys = ON`) e relacionamentos 1:N:
+Arquivo: `banco/nfe_importador.db`. São 9 tabelas: 8 ligadas por chaves primárias, chaves estrangeiras
+(`PRAGMA foreign_keys = ON`) e relacionamentos 1:N, e mais a `configuracoes`:
 
 | Tabela | O que guarda | Relaciona com |
 |---|---|---|
 | `fornecedores` | Emitentes das notas (CNPJ, nome, regime tributário) | pai de `notas` e `produtos` |
 | `notas` | Cabeçalho da NF-e (chave de acesso, número, série, data, total) | filha de `fornecedores` |
-| `produtos` | Catálogo de produtos por fornecedor (código, EAN, NCM, CEST, origem, cClassTrib, status) | filha de `fornecedores` |
+| `produtos` | Catálogo de produtos por fornecedor (código, EAN, NCM, CEST, origem, cClassTrib, margem, preço de venda, status) | filha de `fornecedores` |
 | `itens_nota` | Cada item de cada nota (CFOP, origem, cClassTrib, benefício fiscal, quantidade, valores, frete, seguro, desconto, outras despesas) | filha de `notas` e `produtos` |
 | `tributos` | Catálogo fixo dos 14 tributos (ver tabela abaixo) | pai de `impostos_item` |
 | `impostos_item` | Imposto de cada item (CST/CSOSN, modalidade da base, base, redução da base, MVA, alíquota, valor) | filha de `itens_nota` e `tributos` |
 | `alertas` | Inconsistências encontradas em cada item | filha de `itens_nota` |
 | `importacoes` | Histórico de cada tentativa de importação (ok, duplicada, erro) | referencia `notas` |
+| `configuracoes` | Parâmetros da empresa para o preço de venda (regime, DAS, ICMS, despesas, margem, alíquota da reforma). Tem sempre uma única linha | — |
 
 Regras de integridade que aparecem no uso:
 - Excluir uma nota apaga em cascata os itens, impostos e alertas dela (`ON DELETE CASCADE`).
@@ -94,12 +97,56 @@ No detalhe da nota aparecem só as colunas dos tributos que existem naquela nota
    A **ficha do produto** permite editar os dados de cadastro (NCM, CEST, origem, cClassTrib...) e
    marcar como cadastrado. Também mostra a tributação completa da última compra (modalidade, base,
    redução, MVA, alíquota, valor) e o histórico de compras com frete, seguro, desconto e outras despesas.
+   No final, mostra o **preço de venda sugerido** (veja abaixo).
 5. **Fornecedores**: lista com CNPJ, regime tributário, quantidade de notas e de produtos. Permite
    editar o nome e excluir (só os fornecedores sem vínculos).
 6. **Conferência**: alertas gerados automaticamente na importação, separados em **REFORMA** e
    **GERAL**, com filtro por tipo. Cada alerta pode ser resolvido ou reaberto.
 7. **Relatórios**: total de base de cálculo e de imposto por tributo, e total de mercadorias e de
    impostos por fornecedor.
+
+## Preço de venda sugerido
+
+No final da ficha do produto, o sistema calcula o preço por unidade a partir da última compra. O cálculo
+fica em `precificacao.py` e mostra dois cenários lado a lado, cada um com a memória de cálculo:
+
+**Hoje (2026)**: tributos "por dentro" do preço, com markup divisor.
+```
+custo de compra = produto + frete + seguro + outras − desconto + IPI + ICMS-ST + FCP-ST
+custo líquido   = custo de compra − créditos
+preço           = custo líquido ÷ (1 − (tributos sobre a venda + despesas + margem))
+```
+Os créditos e os tributos da venda dependem do **regime da empresa que compra**:
+
+| Regime | Créditos na compra | Tributos sobre a venda |
+|---|---|---|
+| Simples Nacional | nenhum | alíquota efetiva do DAS |
+| Lucro Presumido | ICMS | ICMS + PIS/COFINS 3,65% + IRPJ/CSLL presumidos |
+| Lucro Real | ICMS + PIS/COFINS 9,25% | ICMS + PIS/COFINS 9,25% |
+
+Também considera que:
+- produto com **ICMS-ST** não tem ICMS na revenda nem crédito;
+- produto **monofásico** (PIS/COFINS CST 04, 05 ou 06) não tem PIS/COFINS na revenda;
+- o PIS/COFINS é calculado sem o ICMS na base (Tema 69 do STF; Lei 14.592/2023 no crédito).
+
+Em 2026 o IBS/CBS de teste é compensado com PIS/COFINS, então não muda o preço.
+
+**Após a reforma (2033, estimativa)**: ICMS, PIS, COFINS e IPI deixam de existir. O IBS/CBS fica "por
+fora" do preço e tudo o que é pago na compra vira crédito.
+```
+custo sem tributos = valor da operação − ICMS − FCP − PIS − COFINS que vinham embutidos
+preço              = custo ÷ (1 − (IRPJ/CSLL + despesas + margem)) + IBS/CBS
+```
+A alíquota de IBS + CBS de 2033 ainda não está fixada (o padrão de 26,5% é uma estimativa e pode ser
+alterado). Produtos com redução, como a cesta básica, usam a mesma redução da compra.
+
+Os **parâmetros da empresa** (regime, DAS, ICMS na venda, IRPJ/CSLL, despesas, margem padrão, alíquota
+de 2033) ficam na tabela `configuracoes` e valem para todos os produtos. A **margem** e o **ICMS na venda**
+podem ser ajustados por produto. O botão "Salvar preço" grava o preço no cadastro e ele aparece na lista
+de produtos.
+
+É uma estimativa para apoiar a decisão, não um cálculo oficial: benefícios fiscais, regimes especiais e
+regras de cada estado não estão incluídos.
 
 ## O que o sistema confere
 
@@ -157,7 +204,7 @@ mostrar a detecção de nota duplicada no histórico.
 ## Roteiro sugerido para a apresentação
 
 1. Mostrar as pastas do projeto e abrir o `banco/nfe_importador.db` (ex.: no DB Browser for SQLite)
-   para mostrar as 8 tabelas.
+   para mostrar as 9 tabelas.
 2. Rodar o sistema e mostrar o **Painel** com os indicadores.
 3. **Notas fiscais**: abrir a NF 9214 e mostrar ICMS, FCP, ICMS-ST com MVA e FCP-ST de cada item. Depois
    abrir a NF 5530 e mostrar o DIFAL. Os itens marcados "REVISAR" mostram o motivo ao passar o mouse.
@@ -167,8 +214,12 @@ mostrar a detecção de nota duplicada no histórico.
 5. **Produtos**: abrir a ficha da cerveja para mostrar a tributação completa (modalidade, MVA, base,
    alíquota). Abrir a ficha do arroz (2 compras com preços diferentes), corrigir o cClassTrib para
    200003 e salvar.
-6. **Fornecedores**: tentar excluir um fornecedor e mostrar o bloqueio pela chave estrangeira.
-7. **Relatórios**: totais por tributo (incluindo FCP, ST e DIFAL) e por fornecedor.
-8. **Importar XML**: excluir uma nota na tela de Notas e importá-la de novo pela pasta
+6. **Preço de venda**: no fim da ficha da água, mostrar a memória de cálculo de hoje e da reforma.
+   Trocar o regime de Simples para Lucro Real e ver o preço mudar por causa dos créditos. Mostrar que
+   a cerveja (ST e monofásico) não tem ICMS nem PIS/COFINS na revenda e que o arroz (cesta básica) fica
+   sem IBS/CBS depois da reforma. Salvar o preço e mostrar a coluna "Preço venda" na lista.
+7. **Fornecedores**: tentar excluir um fornecedor e mostrar o bloqueio pela chave estrangeira.
+8. **Relatórios**: totais por tributo (incluindo FCP, ST e DIFAL) e por fornecedor.
+9. **Importar XML**: excluir uma nota na tela de Notas e importá-la de novo pela pasta
    `xmls_exemplo/`. Importar outra vez para mostrar "Já importada" e importar o
    `05_arquivo_invalido.xml` para mostrar o erro tratado.

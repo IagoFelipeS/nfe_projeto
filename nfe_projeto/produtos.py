@@ -5,9 +5,18 @@ Escopo: consultas e atualizações da tabela produtos + as duas visões (lista e
 """
 import flet as ft
 
+from nfe_projeto import precificacao
 from nfe_projeto.importar import ORIGENS, TRIBUTOS
 
 SIGLAS = [sigla for sigla, _ in TRIBUTOS]
+CAMPOS_EMPRESA = [  # (coluna em configuracoes, rótulo na tela)
+    ("aliquota_simples", "DAS do Simples (%)"),
+    ("icms_venda", "ICMS + FCP na venda (%)"),
+    ("irpj_csll", "IRPJ/CSLL s/ receita (%)"),
+    ("despesas", "Despesas operacionais (%)"),
+    ("margem", "Margem de lucro padrão (%)"),
+    ("aliquota_reforma", "IBS + CBS em 2033 (%)"),
+]
 
 
 # ----------------------------------------------------------------------------- consultas
@@ -17,6 +26,7 @@ def listar_produtos(app, busca="", status=""):
     like = f"%{busca.strip()}%"
     return app.consultar("""
         SELECT p.id, p.codigo, p.ean, p.descricao, p.ncm, p.cclasstrib, p.origem, p.unidade, p.status,
+               p.preco_venda,
                f.nome AS fornecedor,
                (SELECT COUNT(*) FROM itens_nota i WHERE i.produto_id = p.id) AS compras
         FROM produtos p JOIN fornecedores f ON f.id = p.fornecedor_id
@@ -47,11 +57,16 @@ def tributacao_atual(app, produto_id):
 
 
 def ultima_compra(app, produto_id):
-    """Dados do item mais recente (CFOP, origem, benefício fiscal) para a ficha."""
+    """Item mais recente do produto (CFOP, origem, benefício fiscal, quantidade e valores) para a ficha."""
     linhas = app.consultar("""
-        SELECT cfop, origem, cbenef FROM itens_nota
+        SELECT cfop, origem, cbenef, quantidade, valor_unitario, valor_total, frete, seguro, desconto, outras
+        FROM itens_nota
         WHERE id = (SELECT MAX(id) FROM itens_nota WHERE produto_id = ?)""", (produto_id,))
     return linhas[0] if linhas else None
+
+
+def parametros_empresa(app):
+    return app.consultar("SELECT * FROM configuracoes WHERE id = 1")[0]
 
 
 def historico_produto(app, produto_id):
@@ -80,11 +95,12 @@ def _lista(app):
         linhas = [[app.selo_produto(p["status"]), p["codigo"], p["descricao"][:48], p["ncm"],
                    ft.Text(p["origem"] or "—", size=13, tooltip=ORIGENS.get(p["origem"])),
                    p["cclasstrib"] or "—", p["ean"] or "—", p["unidade"], p["fornecedor"], str(p["compras"]),
+                   app.dinheiro(p["preco_venda"]),
                    app.botao("Ficha", lambda e, i=p["id"]: app.ir("produtos", produto_id=i), False)]
                   for p in listar_produtos(app, busca.value or "", filtro["status"])]
         lista.content = app.tabela(
             ["Status", "Código", "Descrição", "NCM", "Orig.", "cClassTrib", "EAN", "Un.", "Fornecedor", "Compras",
-             ""],
+             "Preço venda", ""],
             linhas,
             texto_vazio="Nenhum produto encontrado. Importe uma NF-e para criá-los.")
 
@@ -149,6 +165,7 @@ def _ficha(app, produto_id):
     ], spacing=12))
 
     compra = ultima_compra(app, produto_id)
+    tributos = tributacao_atual(app, produto_id)
     resumo_compra = ft.Text(
         f"Última compra: CFOP {compra['cfop'] or '—'}  ·  benefício fiscal (cBenef) {compra['cbenef'] or '—'}"
         if compra else "Sem compras.", color=app.cor.MUTED)
@@ -166,7 +183,7 @@ def _ficha(app, produto_id):
                     "Alíquota", "Valor", "Detalhes"],
                    [[x["sigla"], x["cst"] or "—", x["modalidade"] or "—", app.dinheiro(x["base"]),
                      app.percentual(x["reducao_base"]), app.percentual(x["mva"]), app.percentual(x["aliquota"]),
-                     app.dinheiro(x["valor"]), x["detalhe"] or "—"] for x in tributacao_atual(app, produto_id)],
+                     app.dinheiro(x["valor"]), x["detalhe"] or "—"] for x in tributos],
                    texto_vazio="Sem impostos destacados."),
         app.subtitulo("Histórico de compras"),
         app.tabela(["NF", "Emissão", "CFOP", "Quantidade", "Valor unitário", "Valor total", "Frete", "Seguro",
@@ -175,4 +192,130 @@ def _ficha(app, produto_id):
                      app.dinheiro(h["valor_unitario"]), app.dinheiro(h["valor_total"]), valor_ou_traco(h["frete"]),
                      valor_ou_traco(h["seguro"]), valor_ou_traco(h["desconto"]), valor_ou_traco(h["outras"])]
                     for h in historico_produto(app, produto_id)]),
+        app.subtitulo("Preço de venda sugerido"),
+        _preco_venda(app, produto, compra, {x["sigla"]: x for x in tributos}) if compra
+        else app.vazio("Sem compras para calcular o preço."),
     ], spacing=16)
+
+
+# ----------------------------------------------------------------------------- preço de venda
+
+def _numero(campo):
+    """Texto digitado ('12,5' ou '12.5') -> 12.5; None se vazio ou inválido."""
+    try:
+        return float((campo.value or "").replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _preco_venda(app, produto, compra, impostos):
+    """Parâmetros da empresa + margem do produto -> preço hoje e preço estimado após a reforma.
+    Qualquer campo alterado recalcula na hora; os botões gravam no banco."""
+    empresa = parametros_empresa(app)
+    tem_st = "ICMS-ST" in impostos
+
+    # ICMS na venda: o do produto; senão, numa compra interna, a mesma alíquota da compra (ICMS + FCP)
+    icms_produto = produto["icms_venda"]
+    if icms_produto is None and compra["cfop"].startswith("5") and impostos.get("ICMS", {}).get("aliquota"):
+        icms_produto = impostos["ICMS"]["aliquota"] + ((impostos.get("FCP") or {}).get("aliquota") or 0)
+
+    def numero_br(valor):
+        return "" if valor is None else app.br(valor).replace(".", "")
+
+    margem = app.campo("Margem de lucro deste produto (%)", numero_br(produto["margem"] or empresa["margem"]), 250,
+                       on_change=lambda e: recalcular())
+    icms = app.campo("ICMS + FCP na venda deste produto (%)", numero_br(icms_produto or empresa["icms_venda"]),
+                     280, on_change=lambda e: recalcular(), disabled=tem_st,
+                     tooltip="Produto com ST: não há ICMS na revenda" if tem_st else None)
+    opcao = getattr(ft, "DropdownOption", None) or ft.dropdown.Option
+    regime = ft.Dropdown(label="Regime da sua empresa", value=empresa["regime"], width=250,
+                         options=[opcao(key=k, text=v) for k, v in precificacao.REGIMES_EMPRESA.items()])
+    if hasattr(regime, "on_select"):  # Flet 1.x usa on_select; versões antigas, on_change
+        regime.on_select = lambda e: recalcular()
+    else:
+        regime.on_change = lambda e: recalcular()
+    campos = {nome: app.campo(rotulo, numero_br(empresa[nome]), 210, on_change=lambda e: recalcular())
+              for nome, rotulo in CAMPOS_EMPRESA}
+    aviso = ft.Text("", color=app.cor.VERDE)
+    cenarios = ft.Row(wrap=True, spacing=16, vertical_alignment=ft.CrossAxisAlignment.START)
+    observacoes = ft.Column(spacing=2)
+    resultado = {"hoje": None}
+
+    def ler_parametros():
+        valores = {nome: _numero(c) for nome, c in campos.items()}
+        if None in valores.values():
+            return None
+        return {"regime": regime.value or "simples", **valores}
+
+    def cartao_cenario(titulo, subtitulo, cenario, destaque):
+        if cenario["erro"]:
+            corpo = [ft.Text(cenario["erro"], color=app.cor.AMBAR)]
+        else:
+            corpo = [ft.Row([ft.Text(descricao, size=13, expand=True), ft.Text(app.dinheiro(valor), size=13)])
+                     for descricao, valor in cenario["linhas"]]
+            corpo += [ft.Divider(height=8),
+                      ft.Row([ft.Text("Preço de venda por unidade", weight="bold", expand=True),
+                              ft.Text(app.dinheiro(cenario["preco"]), size=22, weight="bold", color=destaque)])]
+        return app.cartao(ft.Column([ft.Text(titulo, size=15, weight="bold"),
+                                     ft.Text(subtitulo, size=12, color=app.cor.MUTED)] + corpo, spacing=6),
+                          width=460)
+
+    def recalcular(atualizar=True):
+        parametros, margem_valor, icms_valor = ler_parametros(), _numero(margem), _numero(icms)
+        if parametros is None or margem_valor is None or (icms_valor is None and not tem_st):
+            cenarios.controls = [ft.Text("Preencha todos os percentuais com números.", color=app.cor.AMBAR)]
+            resultado["hoje"] = None
+        else:
+            calculo = precificacao.calcular(compra, impostos, parametros, margem_valor, icms_valor or 0,
+                                            produto["cclasstrib"])
+            resultado["hoje"] = calculo["hoje"]["preco"]
+            cenarios.controls = [
+                cartao_cenario("Hoje (2026)", "ICMS, PIS e COFINS por dentro do preço; IBS/CBS de teste "
+                               "compensados com PIS/COFINS", calculo["hoje"], app.cor.VERDE),
+                cartao_cenario("Após a reforma (2033, estimativa)", "IBS/CBS por fora do preço, com crédito "
+                               "integral na compra", calculo["reforma"], app.cor.AZUL),
+            ]
+            notas = list(calculo["avisos"])
+            hoje, depois = calculo["hoje"]["preco"], calculo["reforma"]["preco"]
+            if hoje and depois:
+                notas.insert(0, f"Diferença do preço final após a reforma: {app.dinheiro(depois - hoje)} "
+                                f"({(depois / hoje - 1) * 100:+.1f}%)".replace(".", ","))
+            observacoes.controls = [ft.Text("• " + n, size=12, color=app.cor.MUTED) for n in notas]
+        if atualizar:
+            app.page.update()
+
+    def salvar_produto(e):
+        if resultado["hoje"] is None:
+            return
+        app.executar("UPDATE produtos SET margem = ?, icms_venda = ?, preco_venda = ? WHERE id = ?",
+                     (_numero(margem), None if tem_st else _numero(icms), round(resultado["hoje"], 2),
+                      produto["id"]))
+        aviso.value = f"Preço de {app.dinheiro(resultado['hoje'])} salvo no cadastro do produto."
+        app.page.update()
+
+    def salvar_empresa(e):
+        parametros = ler_parametros()
+        if parametros is None:
+            return
+        app.executar(f"UPDATE configuracoes SET {', '.join(f'{k} = ?' for k in parametros)} WHERE id = 1",
+                     tuple(parametros.values()))
+        aviso.value = "Parâmetros da empresa salvos (valem para todos os produtos)."
+        app.page.update()
+
+    recalcular(atualizar=False)
+    unitario = app.dinheiro(compra["valor_unitario"])
+    return ft.Column([
+        ft.Text(f"Calculado por unidade a partir da última compra ({app.quantidade(compra['quantidade'])} un. a "
+                f"{unitario}). É uma estimativa para apoiar a decisão, não substitui o contador.",
+                color=app.cor.MUTED),
+        app.cartao(ft.Column([
+            ft.Text("Parâmetros da sua empresa (valem para todos os produtos)", weight="bold"),
+            ft.Row([regime] + list(campos.values()), wrap=True),
+            ft.Row([app.botao("Salvar parâmetros da empresa", salvar_empresa, False)]),
+            ft.Text("Deste produto", weight="bold"),
+            ft.Row([margem, icms], wrap=True),
+            ft.Row([app.botao("Salvar preço no cadastro do produto", salvar_produto), aviso]),
+        ], spacing=10)),
+        cenarios,
+        observacoes,
+    ], spacing=12)

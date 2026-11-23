@@ -1,7 +1,7 @@
 """Tela 2 — Importar XML. Também concentra o banco de dados e a leitura da NF-e.
 
 Escopo deste arquivo:
-  1. BANCO: esquema SQLite (8 tabelas, PKs e FKs 1:N) e conexão.
+  1. BANCO: esquema SQLite (9 tabelas: 8 ligadas por PKs e FKs 1:N + configuracoes) e conexão.
   2. XML: lê a NF-e e extrai produto + impostos de cada item (ICMS, FCP, ICMS-ST, FCP-ST, DIFAL,
      ICMS desonerado, IPI, II, PIS, COFINS, IS, IBS e CBS), com MVA, redução de base e modalidade.
   3. IMPORTAÇÃO: grava tudo em uma transação e registra o histórico. As regras que geram os alertas
@@ -100,7 +100,10 @@ CREATE TABLE IF NOT EXISTS produtos (
     unidade        TEXT NOT NULL DEFAULT '',
     cclasstrib     TEXT NOT NULL DEFAULT '',    -- classificação tributária do IBS/CBS (reforma)
     origem         TEXT NOT NULL DEFAULT '',    -- origem da mercadoria (0 a 8)
-    status       TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente', 'cadastrado')),
+    margem         REAL,                        -- lucro desejado (% do preço); vazio = padrão da empresa
+    icms_venda     REAL,                        -- ICMS (+FCP) na venda (%); vazio = padrão da empresa
+    preco_venda    REAL,                        -- preço de venda calculado e salvo pelo usuário
+    status      TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente', 'cadastrado')),
     UNIQUE (fornecedor_id, codigo)
 );
 
@@ -159,6 +162,18 @@ CREATE TABLE IF NOT EXISTS importacoes (
     nota_id    INTEGER REFERENCES notas(id) ON DELETE SET NULL
 );
 
+-- Parâmetros da empresa usuária para a formação do preço de venda (sempre uma única linha, id = 1)
+CREATE TABLE IF NOT EXISTS configuracoes (
+    id                INTEGER PRIMARY KEY CHECK (id = 1),
+    regime            TEXT NOT NULL DEFAULT 'simples' CHECK (regime IN ('simples', 'presumido', 'real')),
+    aliquota_simples  REAL NOT NULL DEFAULT 8.0,
+    icms_venda        REAL NOT NULL DEFAULT 18.0,
+    irpj_csll         REAL NOT NULL DEFAULT 2.28,
+    despesas          REAL NOT NULL DEFAULT 15.0,
+    margem            REAL NOT NULL DEFAULT 10.0,
+    aliquota_reforma  REAL NOT NULL DEFAULT 26.5
+);
+
 CREATE INDEX IF NOT EXISTS idx_notas_fornecedor ON notas(fornecedor_id);
 CREATE INDEX IF NOT EXISTS idx_itens_nota ON itens_nota(nota_id);
 CREATE INDEX IF NOT EXISTS idx_itens_produto ON itens_nota(produto_id);
@@ -169,7 +184,8 @@ CREATE INDEX IF NOT EXISTS idx_alertas_item ON alertas(item_id);
 
 TEXTO = "TEXT NOT NULL DEFAULT ''"
 COLUNAS_NOVAS = {
-    "produtos": [("cclasstrib", TEXTO), ("origem", TEXTO)],
+    "produtos": [("cclasstrib", TEXTO), ("origem", TEXTO), ("margem", "REAL"), ("icms_venda", "REAL"),
+                 ("preco_venda", "REAL")],
     "itens_nota": [("cclasstrib", TEXTO), ("origem", TEXTO), ("cbenef", TEXTO), ("frete", "REAL"),
                    ("seguro", "REAL"), ("desconto", "REAL"), ("outras", "REAL")],
     "impostos_item": [("modalidade", TEXTO), ("reducao_base", "REAL"), ("mva", "REAL")],
@@ -190,6 +206,7 @@ def conectar(caminho=BANCO):
             if nome not in existentes:
                 conn.execute(f"ALTER TABLE {tabela} ADD COLUMN {nome} {tipo}")
     conn.executemany("INSERT OR IGNORE INTO tributos (sigla, nome) VALUES (?, ?)", TRIBUTOS)
+    conn.execute("INSERT OR IGNORE INTO configuracoes (id) VALUES (1)")
     conn.commit()
     return conn
 
