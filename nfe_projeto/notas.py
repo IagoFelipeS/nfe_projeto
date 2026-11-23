@@ -5,7 +5,7 @@ Escopo: consultas de notas/itens/impostos + as duas visões (lista e detalhe) da
 """
 import flet as ft
 
-COLUNAS_DETALHE = ["Status", "#", "Código", "Descrição", "NCM", "CFOP", "Qtd", "Valor total",
+COLUNAS_DETALHE = ["Status", "#", "Código", "Descrição", "NCM", "CFOP", "cClassTrib", "Qtd", "Valor total",
                    "ICMS", "ICMS-ST", "IPI", "PIS", "COFINS", "IBS", "CBS"]
 SIGLAS = ("ICMS", "ICMS-ST", "IPI", "PIS", "COFINS", "IBS", "CBS")
 
@@ -38,7 +38,7 @@ def obter_nota(app, nota_id):
 def itens_da_nota(app, nota_id):
     """Itens da nota com o produto, os impostos (dicionário por sigla) e os alertas em aberto."""
     itens = app.consultar("""
-        SELECT i.id, i.numero_item, i.cfop, i.quantidade, i.valor_unitario, i.valor_total,
+        SELECT i.id, i.numero_item, i.cfop, i.cclasstrib, i.quantidade, i.valor_unitario, i.valor_total,
                p.id AS produto_id, p.codigo, p.descricao, p.ncm
         FROM itens_nota i JOIN produtos p ON p.id = i.produto_id
         WHERE i.nota_id = ?
@@ -92,7 +92,8 @@ def _detalhe(app, nota_id):
         descricao = ft.TextButton(it["descricao"][:38], tooltip="Abrir ficha do produto",
                                   on_click=lambda e, p=it["produto_id"]: app.ir("produtos", produto_id=p))
         linhas.append([app.selo_conferencia(it["alertas"]), str(it["numero_item"]), it["codigo"], descricao,
-                       it["ncm"], it["cfop"], app.quantidade(it["quantidade"]), app.dinheiro(it["valor_total"])]
+                       it["ncm"], it["cfop"], it["cclasstrib"] or "—", app.quantidade(it["quantidade"]),
+                       app.dinheiro(it["valor_total"])]
                       + [app.resumo_imposto(it["impostos"].get(s)) for s in SIGLAS])
         destaques.append(bool(it["alertas"]))
 

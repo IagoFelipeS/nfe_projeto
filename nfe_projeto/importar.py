@@ -3,7 +3,7 @@
 Escopo deste arquivo:
   1. BANCO: esquema SQLite (8 tabelas, PKs e FKs 1:N) e conexão.
   2. XML: lê a NF-e e extrai produto + impostos de cada item.
-  3. CONFERÊNCIA: regras que geram os alertas de cada item.
+  3. CONFERÊNCIA: regras que geram os alertas de cada item (as da reforma tributária ficam em reforma.py).
   4. IMPORTAÇÃO: grava tudo em uma transação e registra o histórico.
   5. TELA: escolher os XMLs e mostrar o resultado e o histórico.
 
@@ -19,6 +19,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import flet as ft
+
+from nfe_projeto import reforma
 
 # Arquivo do banco SQLite: pasta banco/ na raiz do projeto
 BANCO = Path(__file__).resolve().parent.parent / "banco" / "nfe_importador.db"
@@ -68,7 +70,8 @@ CREATE TABLE IF NOT EXISTS produtos (
     ncm            TEXT NOT NULL DEFAULT '',
     cest           TEXT NOT NULL DEFAULT '',
     unidade        TEXT NOT NULL DEFAULT '',
-    status         TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente', 'cadastrado')),
+    cclasstrib     TEXT NOT NULL DEFAULT '',    -- classificação tributária do IBS/CBS (reforma)
+    status        TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente', 'cadastrado')),
     UNIQUE (fornecedor_id, codigo)
 );
 
@@ -81,7 +84,8 @@ CREATE TABLE IF NOT EXISTS itens_nota (
     quantidade      REAL,
     valor_unitario  REAL,
     valor_total     REAL,
-    grupo_icms      TEXT NOT NULL DEFAULT ''    -- ex.: ICMS00, ICMSSN102
+    grupo_icms      TEXT NOT NULL DEFAULT '',   -- ex.: ICMS00, ICMSSN102
+    cclasstrib      TEXT NOT NULL DEFAULT ''    -- cClassTrib do IBS/CBS informado neste item
 );
 
 CREATE TABLE IF NOT EXISTS tributos (
@@ -132,6 +136,11 @@ def conectar(caminho=BANCO):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")  # SQLite só respeita FKs se isto estiver ligado
     conn.executescript(ESQUEMA)
+    # Bancos criados antes da coluna cclasstrib existir recebem a coluna aqui
+    for tabela in ("produtos", "itens_nota"):
+        colunas = {linha["name"] for linha in conn.execute(f"PRAGMA table_info({tabela})")}
+        if "cclasstrib" not in colunas:
+            conn.execute(f"ALTER TABLE {tabela} ADD COLUMN cclasstrib TEXT NOT NULL DEFAULT ''")
     conn.executemany("INSERT OR IGNORE INTO tributos (sigla, nome) VALUES (?, ?)", TRIBUTOS)
     conn.commit()
     return conn
@@ -207,8 +216,42 @@ def ler_nfe(caminho):
         "cnpj": t(emit, "CNPJ", "CPF"),
         "emitente": t(emit, "xNome"),
         "crt": t(emit, "CRT"),
+        "totais_ibscbs": _totais_ibscbs(inf.find(".//IBSCBSTot")),
     }
     return cabecalho, [_ler_item(det) for det in inf.findall("det")]
+
+
+def _totais_ibscbs(tot):
+    """Totais do IBS/CBS da nota (grupo total/IBSCBSTot), ou None se a nota não tiver o grupo."""
+    if tot is None:
+        return None
+    return {"vbc": t(tot, "vBCIBSCBS"), "vibs": t(tot.find("gIBS"), "vIBS"), "vcbs": t(tot.find("gCBS"), "vCBS")}
+
+
+def _ler_ibscbs(grupo):
+    """Lê o grupo IBSCBS de um item. Cada parte (IBS estadual, municipal e CBS) tem alíquota, valor e,
+    se houver redução (gRed), o percentual de redução e a alíquota efetiva."""
+    if grupo is None:
+        return None
+    calc = grupo.find(".//gIBSCBS")
+
+    def parte(nome_grupo, tag_aliq, tag_valor):
+        g = calc.find(nome_grupo) if calc is not None else None
+        red = g.find("gRed") if g is not None else None
+        return {"aliq": t(g, tag_aliq), "valor": t(g, tag_valor),
+                "reducao": t(red, "pRedAliq"), "efetiva": t(red, "pAliqEfet")}
+
+    return {
+        "cst": t(grupo, "CST"),
+        "cclasstrib": t(grupo, "cClassTrib"),
+        "vbc": t(calc, "vBC"),
+        "vibs": (calc.findtext("vIBS") or "").strip() if calc is not None else "",
+        "uf": parte("gIBSUF", "pIBSUF", "vIBSUF"),
+        "mun": parte("gIBSMun", "pIBSMun", "vIBSMun"),
+        "cbs": parte("gCBS", "pCBS", "vCBS"),
+        "diferimento": grupo.find(".//gDif") is not None,
+        "compra_gov": grupo.find(".//gCompraGov") is not None,
+    }
 
 
 def _ler_item(det):
@@ -219,6 +262,7 @@ def _ler_item(det):
         numero = int(det.get("nItem", "0"))
     except ValueError:
         raise ValueError("número de item inválido no XML")
+    ibscbs = _ler_ibscbs(imp.find("IBSCBS") if imp is not None else None)
     return {
         "n": numero,
         "cod": t(prod, "cProd"),
@@ -232,7 +276,8 @@ def _ler_item(det):
         "vun": t(prod, "vUnCom"),
         "vtot": t(prod, "vProd"),
         "icms_grupo": icms[0].tag if icms is not None and len(icms) else "",
-        "impostos": _impostos(imp, det.find(".//IBSCBS")),
+        "ibscbs": ibscbs,
+        "impostos": _impostos(imp, ibscbs),
     }
 
 
@@ -277,25 +322,31 @@ def _icms(icms):
     return lista
 
 
-def _ibs_cbs(ibs):
-    """IBS e CBS (reforma tributária). Busca as tags em qualquer nível porque o leiaute ainda evolui."""
-    if ibs is None:
+def _ibs_cbs(g):
+    """IBS e CBS (reforma tributária) a partir do grupo já lido por _ler_ibscbs.
+    A alíquota gravada do IBS é a soma estadual + municipal; a redução aparece nos detalhes."""
+    if g is None:
         return []
-    cst, base = t(ibs, "CST"), t(ibs, "vBC")
-    uf, mun = t(ibs, "pIBSUF"), t(ibs, "pIBSMun")
+    uf, mun, cbs = g["uf"], g["mun"], g["cbs"]
     aliq_ibs = ""
-    if uf or mun:
-        aliq_ibs = str(sum((para_decimal(x) or Decimal(0) for x in (uf, mun)), Decimal(0)))
-    partes = []
-    if t(ibs, "cClassTrib"):
-        partes.append(f"cClassTrib {t(ibs, 'cClassTrib')}")
-    if uf:
-        partes.append(f"UF {br(uf)}%")
-    if mun:
-        partes.append(f"Mun. {br(mun)}%")
+    if uf["aliq"] or mun["aliq"]:
+        aliq_ibs = str(sum((para_decimal(x) or Decimal(0) for x in (uf["aliq"], mun["aliq"])), Decimal(0)))
+
+    def reducao(parte):
+        if not parte["reducao"]:
+            return []
+        return [f"redução {br(parte['reducao'])}% → efetiva {br(parte['efetiva'] or '0', 4)}%"]
+
+    partes_ibs = [f"cClassTrib {g['cclasstrib']}"] if g["cclasstrib"] else []
+    if uf["aliq"]:
+        partes_ibs.append(f"UF {br(uf['aliq'])}%")
+    if mun["aliq"]:
+        partes_ibs.append(f"Mun. {br(mun['aliq'])}%")
+    partes_ibs += reducao(uf)
+    partes_cbs = ([f"cClassTrib {g['cclasstrib']}"] if g["cclasstrib"] else []) + reducao(cbs)
     return [
-        _imposto("IBS", cst, base, aliq_ibs, t(ibs, "vIBS"), " · ".join(partes)),
-        _imposto("CBS", cst, base, t(ibs, "pCBS"), t(ibs, "vCBS")),
+        _imposto("IBS", g["cst"], g["vbc"], aliq_ibs, g["vibs"], " · ".join(partes_ibs)),
+        _imposto("CBS", g["cst"], g["vbc"], cbs["aliq"], cbs["valor"], " · ".join(partes_cbs)),
     ]
 
 
@@ -314,8 +365,9 @@ def _bate(base, aliq, valor):
     return abs(b * a / 100 - v) <= TOLERANCIA
 
 
-def validar_item(item, crt):
-    """Devolve a lista de problemas do item. `crt` é o regime tributário do emitente."""
+def validar_item(item, crt, ano=0):
+    """Devolve a lista de problemas do item. `crt` é o regime tributário do emitente e `ano` o ano de emissão
+    (usado pelas regras da reforma tributária, em reforma.py)."""
     msgs = []
 
     ncm = item["ncm"]
@@ -336,11 +388,11 @@ def validar_item(item, crt):
         if crt in ("2", "3") and usa_csosn:
             msgs.append("Emitente do regime normal, mas o ICMS veio com CSOSN (esperado CST)")
 
-    # IBS/CBS ficam de fora: com redução ou diferimento o valor não é base × alíquota nominal
+    # IBS/CBS são conferidos em reforma.py, que considera redução de alíquota e alíquota efetiva
     for imp in item["impostos"]:
         if imp["sigla"] in ("ICMS", "IPI", "PIS", "COFINS") and not _bate(imp["base"], imp["aliq"], imp["valor"]):
             msgs.append(f"{imp['sigla']}: base × alíquota não bate com o valor informado")
-    return msgs
+    return msgs + reforma.validar_item(item, crt, ano)
 
 
 # =============================================================================
@@ -377,18 +429,27 @@ def _gravar(conn, cab, itens, arquivo):
          como_float(cab["total_produtos"]), arquivo)).lastrowid
 
     tributos = {linha["sigla"]: linha["id"] for linha in conn.execute("SELECT id, sigla FROM tributos")}
-    for item in itens:
-        mensagens = validar_item(item, cab["crt"])
-        produto_id, ncm_anterior = _produto(conn, fornecedor_id, item)
-        if ncm_anterior and ncm_anterior != item["ncm"]:
-            mensagens.append(f"NCM diferente do cadastro anterior do produto ({ncm_anterior})")
+    ano = int(cab["data_emissao"][:4]) if cab["data_emissao"][:4].isdigit() else 0
+    # Alertas dos totais da nota ficam no primeiro item (a tabela alertas é ligada a itens)
+    alertas_nota = reforma.validar_totais(cab["totais_ibscbs"], itens)
+    for posicao, item in enumerate(itens):
+        mensagens = validar_item(item, cab["crt"], ano) + (alertas_nota if posicao == 0 else [])
+        produto_id, anterior = _produto(conn, fornecedor_id, item)
+        if anterior and anterior["ncm"] and anterior["ncm"] != item["ncm"]:
+            mensagens.append(f"NCM diferente do cadastro anterior do produto ({anterior['ncm']})")
+        cclass = item["ibscbs"]["cclasstrib"] if item["ibscbs"] else ""
+        if anterior and cclass and anterior["cclasstrib"] and anterior["cclasstrib"] != cclass:
+            mensagens.append(f"Reforma: cClassTrib {cclass} diferente do cadastro anterior do produto "
+                             f"({anterior['cclasstrib']})")
+        elif anterior and cclass and not anterior["cclasstrib"]:
+            conn.execute("UPDATE produtos SET cclasstrib = ? WHERE id = ?", (cclass, produto_id))
 
         item_id = conn.execute(
             """INSERT INTO itens_nota (nota_id, produto_id, numero_item, cfop, quantidade,
-                                       valor_unitario, valor_total, grupo_icms)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                       valor_unitario, valor_total, grupo_icms, cclasstrib)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (nota_id, produto_id, item["n"], item["cfop"], como_float(item["qtd"]), como_float(item["vun"]),
-             como_float(item["vtot"]), item["icms_grupo"])).lastrowid
+             como_float(item["vtot"]), item["icms_grupo"], cclass)).lastrowid
         for imp in item["impostos"]:
             conn.execute(
                 """INSERT INTO impostos_item (item_id, tributo_id, cst, base, aliquota, valor, detalhe)
@@ -411,17 +472,18 @@ def _fornecedor(conn, cab):
 
 
 def _produto(conn, fornecedor_id, item):
-    """Acha o produto (fornecedor + código) ou cria. Devolve (id, ncm que já estava cadastrado)."""
-    linha = conn.execute("SELECT id, ncm FROM produtos WHERE fornecedor_id = ? AND codigo = ?",
+    """Acha o produto (fornecedor + código) ou cria. Devolve (id, cadastro anterior com ncm e cclasstrib)
+    — o cadastro anterior é None quando o produto acabou de ser criado."""
+    linha = conn.execute("SELECT id, ncm, cclasstrib FROM produtos WHERE fornecedor_id = ? AND codigo = ?",
                          (fornecedor_id, item["cod"])).fetchone()
     if linha:
-        return linha["id"], linha["ncm"]
+        return linha["id"], linha
     novo = conn.execute(
-        """INSERT INTO produtos (fornecedor_id, codigo, ean, descricao, ncm, cest, unidade)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO produtos (fornecedor_id, codigo, ean, descricao, ncm, cest, unidade, cclasstrib)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (fornecedor_id, item["cod"], item["ean"], item["desc"] or "(sem descrição)", item["ncm"],
-         item["cest"], item["un"])).lastrowid
-    return novo, ""
+         item["cest"], item["un"], item["ibscbs"]["cclasstrib"] if item["ibscbs"] else "")).lastrowid
+    return novo, None
 
 
 def _registrar(conn, arquivo, resultado, mensagem, nota_id=None):

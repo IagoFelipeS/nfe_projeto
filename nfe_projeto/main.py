@@ -288,6 +288,7 @@ def painel(app):
         "produtos": "SELECT COUNT(*) FROM produtos",
         "pendentes": "SELECT COUNT(*) FROM produtos WHERE status = 'pendente'",
         "alertas": "SELECT COUNT(*) FROM alertas WHERE resolvido = 0",
+        "reforma": "SELECT COUNT(*) FROM alertas WHERE resolvido = 0 AND mensagem LIKE 'Reforma:%'",
     }
     n = {chave: app.conn.execute(sql).fetchone()[0] for chave, sql in contagens.items()}
 
@@ -307,7 +308,8 @@ def painel(app):
         ft.Row([indicador("Notas importadas", n["notas"]),
                 indicador("Produtos", n["produtos"]),
                 indicador("Produtos pendentes de cadastro", n["pendentes"], Cor.AMBAR),
-                indicador("Alertas em aberto", n["alertas"], Cor.AMBAR if n["alertas"] else Cor.VERDE)],
+                indicador("Alertas em aberto", n["alertas"], Cor.AMBAR if n["alertas"] else Cor.VERDE),
+                indicador("Alertas da reforma (IBS/CBS)", n["reforma"], Cor.AMBAR if n["reforma"] else Cor.VERDE)],
                spacing=16),
         subtitulo("Últimas notas"),
         tabela(["NF", "Emissão", "Fornecedor", "Total", "Itens", ""], linhas,

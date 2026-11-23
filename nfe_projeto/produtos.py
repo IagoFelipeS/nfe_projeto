@@ -12,14 +12,15 @@ def listar_produtos(app, busca="", status=""):
     """Produtos com fornecedor e quantidade de compras. Filtra por texto e por status."""
     like = f"%{busca.strip()}%"
     return app.consultar("""
-        SELECT p.id, p.codigo, p.ean, p.descricao, p.ncm, p.unidade, p.status,
+        SELECT p.id, p.codigo, p.ean, p.descricao, p.ncm, p.cclasstrib, p.unidade, p.status,
                f.nome AS fornecedor,
                (SELECT COUNT(*) FROM itens_nota i WHERE i.produto_id = p.id) AS compras
         FROM produtos p JOIN fornecedores f ON f.id = p.fornecedor_id
-        WHERE (? = '' OR p.descricao LIKE ? OR p.codigo LIKE ? OR p.ncm LIKE ? OR p.ean LIKE ?)
+        WHERE (? = '' OR p.descricao LIKE ? OR p.codigo LIKE ? OR p.ncm LIKE ? OR p.ean LIKE ?
+               OR p.cclasstrib LIKE ?)
           AND (? = '' OR p.status = ?)
         ORDER BY p.descricao
-        LIMIT 300""", (busca.strip(), like, like, like, like, status, status))
+        LIMIT 300""", (busca.strip(), like, like, like, like, like, status, status))
 
 
 def obter_produto(app, produto_id):
@@ -58,15 +59,17 @@ def construir(app, produto_id=None):
 def _lista(app):
     filtro = {"status": ""}  # '', 'pendente' ou 'cadastrado'
     lista = ft.Container()
-    busca = app.campo("Buscar por descrição, código, NCM ou EAN", largura=420, on_change=lambda e: atualizar())
+    busca = app.campo("Buscar por descrição, código, NCM, EAN ou cClassTrib", largura=420,
+                      on_change=lambda e: atualizar())
 
     def montar():
-        linhas = [[app.selo_produto(p["status"]), p["codigo"], p["descricao"][:48], p["ncm"], p["ean"] or "—",
-                   p["unidade"], p["fornecedor"], str(p["compras"]),
+        linhas = [[app.selo_produto(p["status"]), p["codigo"], p["descricao"][:48], p["ncm"],
+                   p["cclasstrib"] or "—", p["ean"] or "—", p["unidade"], p["fornecedor"], str(p["compras"]),
                    app.botao("Ficha", lambda e, i=p["id"]: app.ir("produtos", produto_id=i), False)]
                   for p in listar_produtos(app, busca.value or "", filtro["status"])]
         lista.content = app.tabela(
-            ["Status", "Código", "Descrição", "NCM", "EAN", "Un.", "Fornecedor", "Compras", ""], linhas,
+            ["Status", "Código", "Descrição", "NCM", "cClassTrib", "EAN", "Un.", "Fornecedor", "Compras", ""],
+            linhas,
             texto_vazio="Nenhum produto encontrado. Importe uma NF-e para criá-los.")
 
     def atualizar():
@@ -96,12 +99,14 @@ def _ficha(app, produto_id):
     ean = app.campo("EAN / GTIN", produto["ean"], 220)
     cest = app.campo("CEST", produto["cest"], 150)
     unidade = app.campo("Unidade", produto["unidade"], 110)
+    cclasstrib = app.campo("cClassTrib (IBS/CBS)", produto["cclasstrib"], 200)
     aviso = ft.Text("", color=app.cor.VERDE)
 
     def salvar(e):
-        app.executar("UPDATE produtos SET descricao = ?, ncm = ?, ean = ?, cest = ?, unidade = ? WHERE id = ?",
+        app.executar("""UPDATE produtos SET descricao = ?, ncm = ?, ean = ?, cest = ?, unidade = ?, cclasstrib = ?
+                        WHERE id = ?""",
                      (descricao.value.strip() or produto["descricao"], ncm.value.strip(), ean.value.strip(),
-                      cest.value.strip(), unidade.value.strip(), produto_id))
+                      cest.value.strip(), unidade.value.strip(), cclasstrib.value.strip(), produto_id))
         aviso.value = "Dados salvos."
         app.page.update()
 
@@ -117,7 +122,7 @@ def _ficha(app, produto_id):
         ft.Row([app.selo_produto(produto["status"]),
                 ft.Text(f"Código {produto['codigo']}  ·  {produto['fornecedor']}", color=app.cor.MUTED)]),
         descricao,
-        ft.Row([ncm, ean, cest, unidade], wrap=True),
+        ft.Row([ncm, ean, cest, unidade, cclasstrib], wrap=True),
         ft.Row([app.botao("Salvar alterações", salvar), app.botao(rotulo_status, alternar_status, False), aviso]),
     ], spacing=12))
 
