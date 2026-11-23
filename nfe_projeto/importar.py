@@ -20,7 +20,8 @@ from pathlib import Path
 
 import flet as ft
 
-BANCO = Path(__file__).resolve().parent / "nfe_importador.db"
+# Arquivo do banco SQLite: pasta banco/ na raiz do projeto
+BANCO = Path(__file__).resolve().parent.parent / "banco" / "nfe_importador.db"
 
 # Catálogo de tributos (vira a tabela `tributos`)
 TRIBUTOS = [
@@ -125,7 +126,8 @@ CREATE INDEX IF NOT EXISTS idx_alertas_item ON alertas(item_id);
 
 
 def conectar(caminho=BANCO):
-    """Abre o banco (criando tabelas e o catálogo de tributos na primeira vez)."""
+    """Abre o banco (criando a pasta, as tabelas e o catálogo de tributos na primeira vez)."""
+    Path(caminho).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(caminho), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")  # SQLite só respeita FKs se isto estiver ligado

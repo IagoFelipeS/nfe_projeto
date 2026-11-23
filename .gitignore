@@ -20,11 +20,15 @@ config_local.py
 *.db-journal
 *.sqlite
 *.sqlite3
+# exceção: o banco de demonstração faz parte da entrega
+!banco/nfe_importador.db
 
 # ---- Dados de NF-e (XMLs importados) ----
 xmls/
 notas/
 *.xml
+# exceção: XMLs fictícios de exemplo usados na demonstração
+!xmls_exemplo/*.xml
 
 # ---- Relatórios gerados ----
 *.xlsx

@@ -9,8 +9,14 @@ Escopo deste arquivo:
 
 As outras 6 telas ficam em importar.py, notas.py, produtos.py, fornecedores.py, alertas.py e
 relatorios.py. Cada uma tem a função `construir(app, ...)`, que recebe o Aplicativo e devolve a tela.
-O banco de dados (esquema e conexão) está em importar.py.
+O banco de dados (esquema e conexão) está em importar.py; o arquivo fica em banco/nfe_importador.db.
 """
+import sys
+from pathlib import Path
+
+# Permite rodar tanto "python main.py" (dentro desta pasta) quanto "python nfe_projeto/main.py" (da raiz)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import flet as ft
 
 import nfe_projeto.alertas as alertas
